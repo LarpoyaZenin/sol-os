@@ -1514,7 +1514,14 @@ void desktop_poll(void) {
         w->x = nx;
         w->y = ny;
         redraw_union(ox, oy, ow, oh, nx, ny, w->w, w->h);
-        redraw_taskbar();
+        /* No redraw_taskbar() here: the union redraw is clamped to y <=
+         * work_h() (windows never extend into the taskbar strip), so the
+         * taskbar is untouched by the blit and its content (window
+         * buttons, active highlight, clock) does not change while a
+         * window is merely being moved. The active-highlight update
+         * happens once, in handle_left_press() via win_raise(). Skipping
+         * it here avoids recompositing + blitting the whole 1920px-wide
+         * taskbar strip on every mouse-move poll during a drag. */
     }
 
     if (g_resize >= 0 && g_wins[g_resize].used) {
@@ -1533,7 +1540,9 @@ void desktop_poll(void) {
                 w->w = nw;
                 w->h = nh;
                 redraw_union(ox, oy, ow, oh, w->x, w->y, nw, nh);
-                redraw_taskbar();
+                /* Same rationale as the drag path: resizing never touches
+                 * the taskbar strip, and nothing on the taskbar depends on
+                 * a window's size, so skip the redundant full-strip blit. */
             }
         }
     }
