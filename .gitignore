@@ -1,0 +1,7 @@
+build/
+limine/
+.DS_Store
+*.ppm
+*.iso
+*.log
+*.sock
