@@ -2,11 +2,14 @@
 #include "pmm.h"
 #include "klog.h"
 #include "string.h"
+#include "limine.h"
+#include "arch/x86_64/paging.h"
 
 /* Kernel heap: a first-fit free-list allocator.
  *
- * The heap is one contiguous run of physical pages mapped through the
- * HHDM. Every block (allocated or free) carries a header describing
+ * The heap is one contiguous *virtual* range mapped through the HHDM,
+ * backed by whatever physical pages the PMM has free (they need not be
+ * contiguous). Every block (allocated or free) carries a header describing
  * its payload size, and free blocks additionally link into a
  * doubly-linked list that is kept sorted by address so that freeing
  * can coalesce adjacent blocks. A block is split when an allocation
@@ -42,27 +45,35 @@ static inline size_t align16(size_t n) {
     return (n + 15u) & ~(size_t)15u;
 }
 
-void kheap_init(uint64_t hhdm_offset) {
+void kheap_init(uint64_t hhdm_offset, const struct limine_memmap_response *memmap) {
     uint64_t heap_pages = KHEAP_SIZE / PAGE_SIZE;
 
-    /* Grab a contiguous run of physical pages. */
-    uintptr_t phys = pmm_alloc_page();
-    if (phys == 0) {
-        klog("kheap: FATAL cannot allocate first page\n");
-        for (;;) { __asm__ volatile ("cli; hlt"); }
+    /* The heap needs one contiguous *virtual* range (block allocator
+     * uses pointer arithmetic between blocks), but the physical pages
+     * behind it don't have to be contiguous — UEFI leaves the map too
+     * fragmented for that. So we carve a virtual region above every
+     * region Limine maps through the HHDM (Limine maps exactly the
+     * memory-map regions, never past their ends) and map each heap
+     * page there individually from whatever the PMM hands out. */
+    uint64_t max_end = 0;
+    for (uint64_t i = 0; i < memmap->entry_count; i++) {
+        uint64_t end = memmap->entries[i]->base + memmap->entries[i]->length;
+        if (end > max_end) max_end = end;
     }
-    uintptr_t prev = phys;
-    for (uint64_t i = 1; i < heap_pages; i++) {
+    uint64_t virt_off = (max_end + 0x200000ull - 1) & ~(0x200000ull - 1);
+    uint64_t heap_virt = hhdm_offset + virt_off;
+
+    for (uint64_t i = 0; i < heap_pages; i++) {
         uintptr_t pg = pmm_alloc_page();
-        if (pg != prev + PAGE_SIZE) {
-            klog("kheap: FATAL physical pages not contiguous (%lx != %lx)\n",
-                 (unsigned long)pg, (unsigned long)(prev + PAGE_SIZE));
+        if (pg == 0) {
+            klog("kheap: FATAL cannot allocate page %lu/%lu\n",
+                 (unsigned long)i, (unsigned long)heap_pages);
             for (;;) { __asm__ volatile ("cli; hlt"); }
         }
-        prev = pg;
+        paging_map_physical_at(hhdm_offset, heap_virt + i * PAGE_SIZE, pg, PAGE_SIZE);
     }
 
-    kheap_base = (uint8_t *)(hhdm_offset + phys);
+    kheap_base = (uint8_t *)heap_virt;
     kheap_size = KHEAP_SIZE;
 
     /* One big free block covering the whole heap. */
@@ -73,9 +84,9 @@ void kheap_init(uint64_t hhdm_offset) {
     kheap_head->prev = NULL;
     kheap_head->next = NULL;
 
-    klog("kheap: %lu KiB heap at virt %p (phys %lx)\n",
+    klog("kheap: %lu KiB heap at virt %p (pages above phys max %lx)\n",
          (unsigned long)(KHEAP_SIZE / 1024), (void *)kheap_base,
-         (unsigned long)phys);
+         (unsigned long)max_end);
 }
 
 void *kmalloc(size_t size) {

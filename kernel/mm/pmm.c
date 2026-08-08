@@ -60,16 +60,22 @@ void pmm_init(const struct limine_memmap_response *memmap, uint64_t hhdm) {
     uint64_t bitmap_bytes = pmm_total_pages / 8;
     uint64_t bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    /* Place the bitmap at the start of the first usable region. */
+    /* Place the bitmap at the start of the first usable region. A
+     * usable region legitimately starting at physical address 0 (which
+     * UEFI boot can report, under protocol base revision >= 3) must
+     * not be mistaken for "no usable region", so track success with a
+     * flag rather than testing the address itself. */
     uintptr_t bitmap_phys = 0;
+    int bitmap_found = 0;
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *e = memmap->entries[i];
         if (e->type == LIMINE_MEMMAP_USABLE) {
             bitmap_phys = e->base;
+            bitmap_found = 1;
             break;
         }
     }
-    if (bitmap_phys == 0) {
+    if (!bitmap_found) {
         klog("PMM: FATAL no usable memory region\n");
         for (;;) { __asm__ volatile ("cli; hlt"); }
     }

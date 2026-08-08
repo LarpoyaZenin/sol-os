@@ -99,7 +99,7 @@ void kmain(void) {
     if (hhdm_request.response != NULL) {
         hhdm_offset = hhdm_request.response->offset;
         pmm_init(memmap_request.response, hhdm_offset);
-        kheap_init(hhdm_offset);
+        kheap_init(hhdm_offset, memmap_request.response);
         pmm_selftest();
         heap_selftest();
     } else {
@@ -126,7 +126,7 @@ void kmain(void) {
     virtio_input_init(hhdm_offset);
     klog("VirtIO input initialized.\n");
 
-    desktop_init(fb);
+    desktop_init(fb, hhdm_offset);
 
     /* Main loop: echo typed characters to serial, let the desktop
      * drain input and run the UI, and log a heartbeat every ~5

@@ -13,8 +13,10 @@
 
 /* Builds the desktop scene and shows the cursor. Requires the
  * framebuffer to be initialized (fb_init) and the kernel heap to be
- * up (kheap_init) — call after the PCI/VirtIO setup. */
-void desktop_init(struct limine_framebuffer *fb);
+ * up (kheap_init) — call after the PCI/VirtIO setup. `hhdm` is the
+ * higher-half direct-map offset, forwarded to the framebuffer layer
+ * so it can map the second VRAM page for page flipping. */
+void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm);
 
 /* One poll from the main loop: drains VirtIO input, moves the cursor
  * with the VirtIO mouse, dispatches clicks (window management), and

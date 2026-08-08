@@ -37,18 +37,22 @@ static uintptr_t paging_new_table(uint64_t hhdm) {
     return phys;
 }
 
-void paging_map_physical(uint64_t hhdm, uint64_t phys, uint64_t len) {
+/* Maps the physical range [phys, phys+len) at virtual addresses
+ * [vaddr, vaddr+len) using 4KiB pages. `vaddr` must be aligned to the
+ * start page of `phys`. Shared core of paging_map_physical() and
+ * paging_map_physical_at(). */
+void paging_map_physical_at(uint64_t hhdm, uint64_t vaddr, uint64_t phys, uint64_t len) {
     uint64_t *pml4 = (uint64_t *)(hhdm + PTE_FRAME(paging_read_cr3()));
 
     uint64_t start = phys & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t end = phys + len;
+    uint64_t v = vaddr;
 
-    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
-        uint64_t vaddr = hhdm + page;
-        uint64_t pml4_i = PAGE_INDEX_SHIFT(vaddr, 39);
-        uint64_t pdpt_i = PAGE_INDEX_SHIFT(vaddr, 30);
-        uint64_t pd_i   = PAGE_INDEX_SHIFT(vaddr, 21);
-        uint64_t pt_i   = PAGE_INDEX_SHIFT(vaddr, 12);
+    for (uint64_t page = start; page < end; page += PAGE_SIZE, v += PAGE_SIZE) {
+        uint64_t pml4_i = PAGE_INDEX_SHIFT(v, 39);
+        uint64_t pdpt_i = PAGE_INDEX_SHIFT(v, 30);
+        uint64_t pd_i   = PAGE_INDEX_SHIFT(v, 21);
+        uint64_t pt_i   = PAGE_INDEX_SHIFT(v, 12);
 
         if (!(pml4[pml4_i] & PAGE_PRESENT)) {
             uintptr_t np = paging_new_table(hhdm);
@@ -73,6 +77,11 @@ void paging_map_physical(uint64_t hhdm, uint64_t phys, uint64_t len) {
         }
         uint64_t *pt = (uint64_t *)(hhdm + PTE_FRAME(pd[pd_i]));
         pt[pt_i] = page | PAGE_PRESENT | PAGE_WRITABLE;
-        paging_invlpg(vaddr);
+        paging_invlpg(v);
     }
+}
+
+void paging_map_physical(uint64_t hhdm, uint64_t phys, uint64_t len) {
+    paging_map_physical_at(hhdm, hhdm + (phys & ~(uint64_t)(PAGE_SIZE - 1)),
+                           phys, len);
 }

@@ -9,6 +9,36 @@
  * couldn't set a video mode). */
 int fb_init(struct limine_framebuffer *fb);
 
+/* ---- page-flipped double buffering ----
+ *
+ * When enabled, VRAM holds two full-screen pages and every primitive
+ * targets the currently "active" page, which is flipped into the
+ * scanout with fb_flip_pages(). This lets the desktop composite
+ * damage onto the back page and present it atomically (ideally at
+ * vblank), so the display never shows a half-updated frame. If the
+ * VBE interface or enough VRAM is unavailable, double buffering stays
+ * off and the whole stack degrades to the original single-buffer
+ * behaviour. `hhdm` is the higher-half direct-map offset (used to
+ * recover the framebuffer's physical address so the second VRAM page
+ * can be mapped in — the bootloader only maps the visible surface). */
+int fb_enable_double_buffer(uint64_t hhdm);
+int fb_double_buffered(void);
+
+void fb_set_active_page(unsigned page);
+uint8_t *fb_active_base(void);
+uint8_t *fb_page_base(unsigned page);
+
+/* Present the active page: updates the VBE scanout offset (no-op when
+ * single-buffered). */
+void fb_flip_pages(void);
+
+/* Detects whether the VGA vertical-retrace bit actually toggles on
+ * this machine/emulator, so callers can wait for vblank without ever
+ * hanging on a device that does not drive it. */
+void fb_vsync_probe(void);
+int  fb_vsync_live(void);
+int  fb_vblank_active(void);
+
 void fb_clear(uint32_t color);
 
 /* Core pixel/rect primitives. All coordinates are signed and every

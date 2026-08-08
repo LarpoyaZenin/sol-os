@@ -4,11 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Carves a contiguous heap out of physical memory (mapped through the
- * HHDM) and installs it as the kernel heap. `hhdm_offset` is the
- * higher-half direct-map offset from the Limine HHDM request. Must be
- * called after pmm_init(). */
-void kheap_init(uint64_t hhdm_offset);
+struct limine_memmap_response;
+
+/* Carves a contiguous virtual heap out of physical memory and installs
+ * it as the kernel heap. The virtual range sits just above every region
+ * the bootloader mapped through the HHDM; each 4KiB heap page is mapped
+ * there individually from a physical page the PMM provides, so the
+ * backing pages need not be contiguous. `hhdm_offset` is the Limine
+ * HHDM offset; `memmap` its memory-map response. Must be called after
+ * pmm_init(). */
+void kheap_init(uint64_t hhdm_offset, const struct limine_memmap_response *memmap);
 
 /* Allocates `size` bytes, 16-byte aligned. Returns NULL on OOM. */
 void *kmalloc(size_t size);

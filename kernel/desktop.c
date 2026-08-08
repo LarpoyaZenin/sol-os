@@ -91,11 +91,18 @@
 
 /* ---- state ---- */
 
-static struct limine_framebuffer *g_fb;
 static uint64_t g_w, g_h, g_pitch;
-static uint8_t *g_fbaddr;
 static uint32_t *g_bb;          /* full-screen backbuffer */
 static uint64_t g_bb_bytes;     /* g_w * g_h * 4 */
+
+/* Page-flipped double buffering state. When g_flip is set the desktop
+ * composites onto the back page in VRAM and presents it atomically
+ * instead of blitting damage straight onto the live scanout, so the
+ * display can never catch a half-updated frame. */
+static int      g_flip;
+static unsigned g_front;        /* page currently displayed (0/1) */
+static int64_t  g_cur_on_x[2];  /* cursor position drawn on each page */
+static int64_t  g_cur_on_y[2];  /* -1 = no cursor on that page */
 
 /* Backbuffer guard: the allocation is bb_bytes + 64, and the trailing
  * words are stamped with canaries. Any out-of-bounds backbuffer write
@@ -145,6 +152,17 @@ static int64_t g_resize_w;       /* window size when the resize began */
 static int64_t g_resize_h;
 static int g_start_menu;         /* 1 when the Start menu is open */
 static unsigned g_icon_opens;
+
+/* Deferred damage. redraw_rect()/render_clock() composite into the
+ * backbuffer and record the union of the pixels they touched; the
+ * actual blit happens once per poll in present(). With page flipping
+ * the back page additionally needs every region that changed over the
+ * previous frame too (it shows a two-frame-old scene), so the last
+ * frame's damage is kept around as well. */
+static int      g_damage_present;
+static int64_t  g_damage_x, g_damage_y, g_damage_w, g_damage_h;
+static int      g_damage_prev_present;
+static int64_t  g_damage_prev_x, g_damage_prev_y, g_damage_prev_w, g_damage_prev_h;
 
 /* ---- desktop icons ---- */
 
@@ -371,18 +389,66 @@ static int64_t bb_draw_string(int64_t x, int64_t y, const char *s, uint32_t fg) 
 
 /* ---- blits (backbuffer -> framebuffer) ---- */
 
+/* Copies a full row of `bytes` bytes in the widest stores that are
+ * safe on the (possibly MMIO) framebuffer. The kernel is built with
+ * -mno-sse, so this is a plain 64-bit integer loop; both buffers are
+ * 4-byte aligned by construction and the 8-byte fast path is only
+ * taken when both ends are 8-byte aligned. */
+static void blit_copy(uint8_t *dst, const uint8_t *src, size_t bytes) {
+    if ((((uintptr_t)dst | (uintptr_t)src) & 7u) == 0u) {
+        size_t n = bytes >> 3;
+        uint64_t *d = (uint64_t *)dst;
+        const uint64_t *s = (const uint64_t *)src;
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        dst += n << 3;
+        src += n << 3;
+        bytes &= 7u;
+    }
+    if (bytes >= 4) {
+        *(uint32_t *)dst = *(const uint32_t *)src;
+        dst += 4;
+        src += 4;
+        bytes -= 4;
+    }
+    for (size_t i = 0; i < bytes; i++) dst[i] = src[i];
+}
+
 static void blit_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     int64_t x0, y0, x1, y1;
     if (!bb_clip(x, y, w, h, &x0, &y0, &x1, &y1)) return;
+    uint8_t *base = fb_active_base();
     for (int64_t yy = y0; yy < y1; yy++) {
-        uint8_t *dst = g_fbaddr + (uint64_t)yy * g_pitch + (uint64_t)x0 * 4u;
+        uint8_t *dst = base + (uint64_t)yy * g_pitch + (uint64_t)x0 * 4u;
         const uint8_t *src = (const uint8_t *)(g_bb + (uint64_t)yy * g_w) + (uint64_t)x0 * 4u;
-        memcpy(dst, src, (size_t)((x1 - x0) * 4));
+        blit_copy(dst, src, (size_t)((x1 - x0) * 4));
     }
 }
 
 static void blit_full(void) {
     blit_rect(0, 0, (int64_t)g_w, (int64_t)g_h);
+}
+
+/* Records the union of a region touched this frame, for one deferred
+ * blit in present(). Clipped to the visible screen. */
+static void damage_add(int64_t x, int64_t y, int64_t w, int64_t h) {
+    int64_t x0, y0, x1, y1;
+    if (!bb_clip(x, y, w, h, &x0, &y0, &x1, &y1)) return;
+    if (!g_damage_present) {
+        g_damage_x = x0;
+        g_damage_y = y0;
+        g_damage_w = x1 - x0;
+        g_damage_h = y1 - y0;
+        g_damage_present = 1;
+    } else {
+        int64_t nx0 = i64_min(g_damage_x, x0);
+        int64_t ny0 = i64_min(g_damage_y, y0);
+        int64_t nx1 = i64_max(g_damage_x + g_damage_w, x1);
+        int64_t ny1 = i64_max(g_damage_y + g_damage_h, y1);
+        g_damage_x = nx0;
+        g_damage_y = ny0;
+        g_damage_w = nx1 - nx0;
+        g_damage_h = ny1 - ny0;
+    }
 }
 
 /* ---- cursor ---- */
@@ -715,7 +781,7 @@ static int gfx_selftest(void) {
 
 static void redraw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     scene_region(x, y, w, h);
-    blit_rect(x, y, w, h);
+    damage_add(x, y, w, h);
 }
 
 static void redraw_union(int64_t x0, int64_t y0, int64_t w0, int64_t h0,
@@ -795,8 +861,8 @@ static void render_clock(void) {
     bb_clear_region(x - pad, (int64_t)g_h - TASKBAR_H + 4,
                     (int64_t)tw + 2 * pad, TASKBAR_H - 8, TASKBAR_BG);
     bb_draw_string(x, y, buf, CLOCK_TEXT);
-    blit_rect(x - pad, (int64_t)g_h - TASKBAR_H + 4,
-              (int64_t)tw + 2 * pad, TASKBAR_H - 8);
+    damage_add(x - pad, (int64_t)g_h - TASKBAR_H + 4,
+               (int64_t)tw + 2 * pad, TASKBAR_H - 8);
 }
 
 /* ---- Start menu ---- */
@@ -1407,7 +1473,7 @@ static int win_topmost_at(int64_t px, int64_t py) {
 
 /* ---- public API ---- */
 
-void desktop_init(struct limine_framebuffer *fb) {
+void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
     if (fb == NULL) {
         klog("[desktop] FATAL: no framebuffer\n");
         for (;;) { __asm__ volatile ("cli; hlt"); }
@@ -1417,11 +1483,9 @@ void desktop_init(struct limine_framebuffer *fb) {
              (unsigned)fb->bpp);
         for (;;) { __asm__ volatile ("cli; hlt"); }
     }
-    g_fb = fb;
     g_w = fb->width;
     g_h = fb->height;
     g_pitch = fb->pitch;
-    g_fbaddr = (uint8_t *)fb->address;
     g_drag = -1;
     g_resize = -1;
 
@@ -1450,6 +1514,17 @@ void desktop_init(struct limine_framebuffer *fb) {
 
     gfx_selftest();
 
+    /* Arm page-flipped double buffering if the hardware supports it.
+     * Everything below works either way; g_flip only changes how the
+     * finished frame reaches the screen. */
+    g_flip = fb_enable_double_buffer(hhdm);
+    if (g_flip) fb_vsync_probe();
+    g_front = 0;
+    g_cur_on_x[0] = g_cur_on_y[0] = -1;
+    g_cur_on_x[1] = g_cur_on_y[1] = -1;
+    g_damage_present = 0;
+    g_damage_prev_present = 0;
+
     static const char *about_lines[] = {
         "Welcome to Sol OS!",
         "Desktop: mouse via VirtIO.",
@@ -1461,20 +1536,100 @@ void desktop_init(struct limine_framebuffer *fb) {
     win_open("About Sol OS", 120, 90, 460, 240, 0, about_lines, 6);
 
     scene_region(0, 0, (int64_t)g_w, (int64_t)g_h);
-    blit_full();
+    if (g_flip) {
+        /* Both pages start as a consistent copy of the scene so a
+         * later flip never reveals stale pixels. */
+        fb_set_active_page(0);
+        blit_full();
+        fb_set_active_page(1);
+        blit_full();
+        fb_set_active_page(0);
+    } else {
+        blit_full();
+    }
     g_last_second = timer_get_ticks() / 100;
 
     g_cursor_x = (int64_t)g_w / 2 - CURSOR_W / 2;
     g_cursor_y = (int64_t)g_h / 2 - CURSOR_H / 2;
+    g_cur_on_x[g_front] = g_cursor_x;
+    g_cur_on_y[g_front] = g_cursor_y;
     cursor_draw();
 
-    klog("[desktop] %lu x %lu desktop up, %u window(s), heap free %lu KiB\n",
+    klog("[desktop] %lu x %lu desktop up (%s buffered), %u window(s), "
+         "heap free %lu KiB\n",
          (unsigned long)g_w, (unsigned long)g_h,
+         g_flip ? "double" : "single",
          (unsigned)win_count(), (unsigned long)(kheap_free_bytes() / 1024));
 }
 
+/* ---- presenting the finished frame ---- */
+
+/* Single-buffer path: restore the old cursor (the cursor was erased
+ * from the live page at the start of the poll), blit this frame's
+ * damage, then draw the cursor at its new position. */
+static void present_single(void) {
+    if (g_damage_present) {
+        blit_rect(g_damage_x, g_damage_y, g_damage_w, g_damage_h);
+        g_damage_present = 0;
+    }
+    cursor_draw();
+}
+
+/* Page-flip path: bring the back page up to the current scene and
+ * present it. The back page last held a scene two frames old (with a
+ * cursor stamped on it when it was the front page), so it needs the
+ * previous frame's damage too, plus that stale cursor erased. */
+static void present_flip(void) {
+    unsigned back = 1u - g_front;
+
+    fb_set_active_page(back);
+
+    if (g_cur_on_y[back] >= 0) {
+        blit_rect(g_cur_on_x[back], g_cur_on_y[back], CURSOR_W, CURSOR_H);
+    }
+    if (g_damage_prev_present) {
+        blit_rect(g_damage_prev_x, g_damage_prev_y,
+                  g_damage_prev_w, g_damage_prev_h);
+    }
+    if (g_damage_present) {
+        blit_rect(g_damage_x, g_damage_y, g_damage_w, g_damage_h);
+    }
+
+    g_damage_prev_present = g_damage_present;
+    g_damage_prev_x = g_damage_x;
+    g_damage_prev_y = g_damage_y;
+    g_damage_prev_w = g_damage_w;
+    g_damage_prev_h = g_damage_h;
+    g_damage_present = 0;
+
+    /* Flip at vertical retrace when the hardware drives it, so the
+     * new page never lands in the middle of a scanout. Bounded by the
+     * timer so a device with no usable retrace bit can never stall us. */
+    if (fb_vsync_live()) {
+        uint64_t deadline = timer_get_ticks() + 2u;
+        while (!fb_vblank_active() && timer_get_ticks() < deadline) {
+            __asm__ volatile ("pause");
+        }
+    }
+    fb_flip_pages();
+    g_front = back;
+
+    g_cur_on_x[back] = g_cursor_x;
+    g_cur_on_y[back] = g_cursor_y;
+    cursor_draw();
+}
+
+static void present(void) {
+    if (g_flip) present_flip();
+    else present_single();
+}
+
 void desktop_poll(void) {
-    cursor_restore();
+    /* Erase last frame's cursor from the live page. In page-flip mode
+     * the cursor lives on the (currently) front page which will only
+     * be written again when it cycles back to the back page, so this
+     * erase is handled there instead. */
+    if (!g_flip) cursor_restore();
 
     virtio_input_poll();
 
@@ -1591,5 +1746,5 @@ void desktop_poll(void) {
         }
     }
 
-    cursor_draw();
+    present();
 }
