@@ -315,14 +315,18 @@ move_to(1881, 103); click()                 # maximize About again
 shot("/tmp/stress_16.ppm"); img = load("/tmp/stress_16.ppm")
 check("maxdrag: maximized first", near(px(img, 1000, 13), ORANGE))
 move_to(1000, 13); press()
-rel("x", 300); rel("y", 200)                # drag-restore -> size 460x240 at (300,200)
+rel("x", 300); time.sleep(0.1)              # each rel lands in its own poll
+rel("y", 200); time.sleep(0.1)
 release()
 shot("/tmp/stress_16b.ppm"); img = load("/tmp/stress_16b.ppm")
 check("maxdrag: restored size, follows cursor", near(px(img, 500, 204), ORANGE))
-check("maxdrag: no longer fullscreen", near(px(img, 1000, 600), gradient(600)))
+# (1000,600) is covered by Settings (dragged to (672,546) in stage 4), so
+# probe a pixel inside the old maximized area but clear of every window.
+check("maxdrag: no longer fullscreen", near(px(img, 1000, 100), gradient(100)))
 # drag About back to its right-edge clamp position (1460,90)
 move_to(500, 204); press()
-rel("x", 1160); rel("y", -110)
+rel("x", 1160); time.sleep(0.1)
+rel("y", -110); time.sleep(0.1)
 release()
 shot("/tmp/stress_16c.ppm"); img = load("/tmp/stress_16c.ppm")
 check("maxdrag: About parked at right edge", near(px(img, 1580, 94), ORANGE))
@@ -363,6 +367,34 @@ move_to(1905, 103); click()                  # close button (x+w-15, y+13)
 shot("/tmp/stress_18.ppm"); img = load("/tmp/stress_18.ppm")
 check("close: window gone", not near(px(img, 1660, 94), ORANGE))
 check("close: taskbar button removed", not near(px(img, 187, 1043), ORANGE))
+
+# --- stage 8b: window covering the icons must not ghost them ---
+# Regression for the stray-pixel/ghosting bug: a damaged region that
+# does NOT intersect a window currently covering the desktop icons must
+# never cause those icons to be stamped over the window in the
+# backbuffer (scene_region must clip every element to the damage rect).
+# Here a fresh About window is parked at (0,0) over the icons, then the
+# Start menu is toggled (its damage rect is far from the window) and the
+# cursor is swept through the covered icon area. If the icons leaked,
+# their tile colors would show where the window body should be.
+# icon_open counter is 6 at this point -> new window at (372,146).
+move_to(60, 350); click()                    # open About icon (3rd row)
+shot("/tmp/stress_19.ppm"); img = load("/tmp/stress_19.ppm")
+check("cover: About opened", near(px(img, 500, 150), ORANGE))
+move_to(560, 150); press()
+rel("x", -550); rel("y", -146)               # cursor -> (10,4); window clamps to (0,0)
+release()
+shot("/tmp/stress_19b.ppm"); img = load("/tmp/stress_19b.ppm")
+check("cover: window parked over icons", near(px(img, 44, 55), BODY_BG))
+check("cover: title bar orange", near(px(img, 30, 13), ORANGE))
+move_to(40, 1055); click()                   # open Start menu (damage far from window)
+move_to(40, 1055); click()                   # close it again
+move_to(40, 40)                              # cursor sweeps over the covered icons
+move_to(80, 180)                             # ...and over the second icon row too
+move_to(500, 500)                            # and away; leaked pixels would remain
+shot("/tmp/stress_19c.ppm"); img = load("/tmp/stress_19c.ppm")
+check("cover: no icon leak on window body", near(px(img, 44, 55), BODY_BG))
+check("cover: no icon leak lower body", near(px(img, 80, 180), BODY_BG))
 
 s.close()
 

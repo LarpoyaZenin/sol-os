@@ -110,9 +110,44 @@ static char keycode_to_char(uint16_t code) {
         [44] = 'z', [45] = 'x', [46] = 'c', [47] = 'v', [48] = 'b',
         [49] = 'n', [50] = 'm', [51] = ',', [52] = '.', [53] = '/',
         [57] = ' ',
+        /* Navigation keys map to sentinels the terminal understands
+         * (see virtio_keyboard_read_char in the header): */
+        [103] = 0x05,                                 /* up */
+        [104] = 0x01,                                 /* page up */
+        [105] = 0x03,                                 /* left */
+        [106] = 0x04,                                 /* right */
+        [108] = 0x06,                                 /* down */
+        [109] = 0x02,                                 /* page down */
     };
     if (code < 128) return map[code];
     return 0;
+}
+
+/* ---- keyboard character queue ---- */
+
+#define VKEY_BUF_SIZE 256u
+
+static volatile char vkey_buf[VKEY_BUF_SIZE];
+static volatile uint32_t vkey_head;
+static volatile uint32_t vkey_tail;
+
+static void vkey_push(char c) {
+    uint32_t next = (vkey_head + 1) % VKEY_BUF_SIZE;
+    if (next == vkey_tail) return;   /* full — drop the keystroke */
+    vkey_buf[vkey_head] = c;
+    vkey_head = next;
+}
+
+bool virtio_keyboard_read_char(char *out) {
+    __asm__ volatile ("cli");
+    uint32_t t = vkey_tail;
+    bool got = t != vkey_head;
+    if (got) {
+        *out = vkey_buf[t];
+        vkey_tail = (t + 1) % VKEY_BUF_SIZE;
+    }
+    __asm__ volatile ("sti");
+    return got;
 }
 
 static const char *button_name(uint16_t code) {
@@ -199,6 +234,9 @@ static void virtio_input_handle_event(virtio_input_t *vi,
                     klog("[vinput%d] key code=%u '%c'\n", vi->index, (unsigned)ev->code, c);
                 } else {
                     klog("[vinput%d] key code=%u down\n", vi->index, (unsigned)ev->code);
+                }
+                if (c != 0 && ev->value == 1) {
+                    vkey_push(c);
                 }
             }
         }

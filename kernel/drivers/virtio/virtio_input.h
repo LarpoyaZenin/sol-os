@@ -32,6 +32,18 @@ uint32_t virtio_input_device_count(void);
  * true if there was pending motion. */
 bool virtio_mouse_get_delta(int32_t *dx, int32_t *dy, uint8_t *buttons);
 
+/* Pops the oldest buffered character typed on any VirtIO keyboard,
+ * or returns false if the buffer is empty. Non-blocking by design so
+ * the desktop main loop can poll it without stalling. Key events are
+ * queued on the key-down edge (autorepeat is ignored). Printable
+ * characters are passed through (0x20..0x7E); the navigation keys
+ * map to sentinel control values the terminal understands:
+ *   0x01 page up   0x02 page down
+ *   0x03 cursor left   0x04 cursor right
+ *   0x05 up   0x06 down
+ * while enter is 0x0A and backspace is 0x08. */
+bool virtio_keyboard_read_char(char *out);
+
 /* Aggregate event counters (across all devices) for diagnostics. */
 uint64_t virtio_input_irq_count(void);
 uint64_t virtio_input_event_count(void);

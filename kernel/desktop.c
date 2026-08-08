@@ -35,6 +35,26 @@
 #define MIN_WIN_W     200
 #define MIN_WIN_H     120
 
+/* Bottom-right corner grab area for window resizing. */
+#define RESIZE_GUTTER 18
+
+/* Start menu geometry. The menu pops up above the Start button, left
+ * aligned with it, with one row per desktop app. */
+#define MENU_W        200u
+#define MENU_ITEM_H   40u
+#define MENU_PAD      6u
+
+/* Terminal application. Each terminal window owns a fixed scrollback
+ * buffer of TERM_SCROLL_MAX lines (static, never heap-allocated, so
+ * the heap watermark stays flat) plus the current input line. */
+#define TERM_SCROLL_MAX 80
+#define TERM_LINE_MAX   88
+#define TERM_ROW_H      10
+#define TERM_BG        0x00131720u
+#define TERM_TEXT      0x00FFFFFFu
+#define TERM_PROMPT    "solos@sol$ "
+#define TERM_PROMPT_LEN 11u
+
 #define ICON_W        72u
 #define ICON_H        72u
 #define ICON_X0       24
@@ -104,6 +124,13 @@ struct desktop_window {
     int maximized;
     int64_t rest_x, rest_y;
     int64_t rest_w, rest_h;
+    int kind;                      /* 0 = info window, 1 = terminal */
+    char term_lines[TERM_SCROLL_MAX][TERM_LINE_MAX];
+    int term_len;
+    int term_scroll;               /* lines scrolled up from the bottom */
+    char term_input[TERM_LINE_MAX];
+    int term_input_len;
+    int term_cursor_col;
 };
 
 static struct desktop_window g_wins[MAX_WINDOWS];
@@ -111,6 +138,12 @@ static uint32_t g_order_counter;
 static int g_drag;               /* window index being dragged, -1 = none */
 static int64_t g_drag_off_x;
 static int64_t g_drag_off_y;
+static int g_resize;             /* window index being resized, -1 = none */
+static int64_t g_resize_x;       /* cursor position where the resize began */
+static int64_t g_resize_y;
+static int64_t g_resize_w;       /* window size when the resize began */
+static int64_t g_resize_h;
+static int g_start_menu;         /* 1 when the Start menu is open */
 static unsigned g_icon_opens;
 
 /* ---- desktop icons ---- */
@@ -119,6 +152,7 @@ struct desktop_icon {
     const char *label;
     char glyph;
     uint32_t color;
+    int kind;                      /* 0 = info window, 1 = terminal */
     const char *win_title;
     const char *const *win_lines;
     int nlines;
@@ -131,21 +165,39 @@ static const char *const ic_terminal_lines[] = {
     "prove the desktop can launch.",
 };
 static const char *const ic_files_lines[] = {
-    "Sol OS files",
-    "No filesystem mounted yet.",
-    "It is on the roadmap.",
+    "Files",
+    "Home",
+    "  Desktop",
+    "  Documents",
+    "  Downloads",
+    "  Pictures",
+    "  Music",
+    "  Videos",
 };
 static const char *const ic_settings_lines[] = {
-    "Sol OS settings",
-    "Display: 1920x1080, 32 bpp.",
-    "Memory: 256 MiB guest.",
-    "Input: VirtIO keyboard + mouse.",
+    "Settings",
+    "  Resolution: 1920x1080",
+    "  Color depth: 32 bpp",
+    "Appearance",
+    "  Theme: Sol OS default",
+    "System",
+    "  Architecture: x86_64",
+    "  Sol OS version 0.1",
+};
+static const char *const ic_about_lines[] = {
+    "Sol OS",
+    "Version 0.1",
+    "Architecture: x86_64",
+    "Resolution: 1920x1080",
+    "Bootloader: Limine",
+    "Welcome to Sol OS.",
 };
 
 static const struct desktop_icon g_icons[] = {
-    { "Terminal", '>', 0x002E4C73, "Terminal", ic_terminal_lines, 4 },
-    { "Files",    'F', 0x00F5A623, "Files",    ic_files_lines,   3 },
-    { "Settings", 'S', 0x003AAFA9, "Settings", ic_settings_lines, 4 },
+    { "Terminal", '>', 0x002E4C73, 1, "Terminal",    ic_terminal_lines, 4 },
+    { "Files",    'F', 0x00F5A623, 0, "Files",       ic_files_lines,   8 },
+    { "Settings", 'S', 0x003AAFA9, 0, "Settings",    ic_settings_lines, 8 },
+    { "About",    'A', 0x006B5B95, 0, "About Sol OS", ic_about_lines,  6 },
 };
 #define ICON_COUNT (unsigned)(sizeof(g_icons) / sizeof(g_icons[0]))
 
@@ -180,6 +232,7 @@ static int64_t i64_max(int64_t a, int64_t b) { return a > b ? a : b; }
 
 /* Forward declarations (defined later in this file). */
 static void render_taskbar(void);
+static void render_start_menu(void);
 static void win_render(struct desktop_window *w);
 static int  win_rect_intersects(const struct desktop_window *w,
                                 int64_t x, int64_t y, int64_t ww, int64_t hh);
@@ -189,14 +242,36 @@ static int  win_count(void);
 static int  win_is_topmost_win(const struct desktop_window *w);
 static int  win_topmost_at(int64_t px, int64_t py);
 static int  win_open(const char *title, int64_t x, int64_t y,
-                     int64_t w, int64_t h,
+                     int64_t w, int64_t h, int kind,
                      const char *const *lines, int nlines);
+static void term_append_line(struct desktop_window *w, const char *s);
+static void term_render(struct desktop_window *w, int active);
+static void close_start_menu(void);
+static void open_start_menu(void);
+static int  menu_x(void);
+static int  menu_y(void);
+static int  menu_h(void);
 
 /* ---- backbuffer primitives (scene, no cursor) ---- */
 
-/* Clips a rect to the backbuffer [0,g_w)x[0,g_h). Overflow-safe:
- * extents are saturated to the buffer bounds rather than summed.
- * Returns 1 and fills the exclusive bounds when non-empty. */
+/* Active clip rectangle for backbuffer writes. scene_region() scopes
+ * every primitive it issues (gradient, icons, windows, taskbar, start
+ * menu) to the damaged region it is recompositing, so nothing is ever
+ * painted into the backbuffer outside the pixels that will be blitted.
+ *
+ * Without this clip, a scene element that is drawn regardless of the
+ * damaged region (the desktop icons are the prime offender) can stamp
+ * itself over a window that happens to cover it in the backbuffer but
+ * is not part of this redraw. The backbuffer is then wrong and the
+ * damage shows up later, whenever cursor_restore() blits the region:
+ * that is the stray-pixel / ghosting-trail / random-line artifact. */
+static int      g_bb_clip_active;
+static int64_t  g_bb_clip_x0, g_bb_clip_y0, g_bb_clip_x1, g_bb_clip_y1;
+
+/* Clips a rect to the backbuffer [0,g_w)x[0,g_h), and additionally to
+ * the active clip rect when one is set. Overflow-safe: extents are
+ * saturated to the buffer bounds rather than summed. Returns 1 and
+ * fills the exclusive bounds when non-empty. */
 static int bb_clip(int64_t x, int64_t y, int64_t w, int64_t h,
                    int64_t *x0, int64_t *y0, int64_t *x1, int64_t *y1) {
     if (w <= 0 || h <= 0) return 0;
@@ -234,11 +309,22 @@ static int bb_clip(int64_t x, int64_t y, int64_t w, int64_t h,
     *y0 = top;
     *x1 = right;
     *y1 = bottom;
+
+    if (g_bb_clip_active) {
+        if (*x0 < g_bb_clip_x0) *x0 = g_bb_clip_x0;
+        if (*y0 < g_bb_clip_y0) *y0 = g_bb_clip_y0;
+        if (*x1 > g_bb_clip_x1) *x1 = g_bb_clip_x1;
+        if (*y1 > g_bb_clip_y1) *y1 = g_bb_clip_y1;
+        if (*x1 <= *x0 || *y1 <= *y0) return 0;
+    }
     return 1;
 }
 
 static void bb_put_pixel(int64_t x, int64_t y, uint32_t c) {
     if (x < 0 || y < 0 || x >= (int64_t)g_w || y >= (int64_t)g_h) return;
+    if (g_bb_clip_active &&
+        (x < g_bb_clip_x0 || x >= g_bb_clip_x1 ||
+         y < g_bb_clip_y0 || y >= g_bb_clip_y1)) return;
     g_bb[(uint64_t)y * g_w + (uint64_t)x] = c;
 }
 
@@ -340,16 +426,17 @@ static void put_digits(char *buf, size_t *pos, int v, int digits) {
     while (n > 0) buf[(*pos)++] = tmp[--n];
 }
 
+static const char *g_months[12] = {
+    "Jan","Feb","Mar","Apr","May","Jun",
+    "Jul","Aug","Sep","Oct","Nov","Dec",
+};
+
 static void build_clock_str(char *buf) {
     struct rtc_datetime dt;
     if (!rtc_read(&dt)) {
         strcpy(buf, "--:--:--");
         return;
     }
-    static const char *months[12] = {
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec",
-    };
     size_t i = 0;
     put_digits(buf, &i, dt.hour, 2);
     buf[i++] = ':';
@@ -357,7 +444,7 @@ static void build_clock_str(char *buf) {
     buf[i++] = ':';
     put_digits(buf, &i, dt.second, 2);
     buf[i++] = ' ';
-    const char *m = (dt.month >= 1 && dt.month <= 12) ? months[dt.month - 1] : "???";
+    const char *m = (dt.month >= 1 && dt.month <= 12) ? g_months[dt.month - 1] : "???";
     while (*m) buf[i++] = *m++;
     buf[i++] = ' ';
     put_digits(buf, &i, dt.day, 2);
@@ -456,7 +543,8 @@ static void icon_open(int idx) {
     int64_t x = 300 + (int64_t)(g_icon_opens % 4) * 36;
     int64_t y = 90 + (int64_t)(g_icon_opens % 4) * 28;
     g_icon_opens++;
-    int wi = win_open(ic->win_title, x, y, 460, 220, ic->win_lines, ic->nlines);
+    int wi = win_open(ic->win_title, x, y, 460, 220, ic->kind,
+                      ic->win_lines, ic->nlines);
     if (wi >= 0) {
         redraw_rect(g_wins[wi].x, g_wins[wi].y, g_wins[wi].w, g_wins[wi].h);
         redraw_taskbar();
@@ -470,6 +558,20 @@ static void icon_open(int idx) {
 static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
     int64_t x0, y0, x1, y1;
     if (!bb_clip(x, y, w, h, &x0, &y0, &x1, &y1)) return;
+
+    /* Scope every backbuffer write in this composite to the damaged
+     * region [x0,x1) x [y0,y1). Window rendering paints only the
+     * overlapping pixels too: since windows are composited in z-order
+     * and any window covering a damaged pixel necessarily intersects
+     * the region, the result is still correct occlusion, but no
+     * full-scene element (e.g. the icons) can clobber a window in the
+     * backbuffer it is not repainting. */
+    int clip_was_active = g_bb_clip_active;
+    int64_t sx0 = g_bb_clip_x0, sy0 = g_bb_clip_y0;
+    int64_t sx1 = g_bb_clip_x1, sy1 = g_bb_clip_y1;
+    g_bb_clip_active = 1;
+    g_bb_clip_x0 = x0; g_bb_clip_y0 = y0;
+    g_bb_clip_x1 = x1; g_bb_clip_y1 = y1;
 
     for (int64_t yy = y0; yy < y1; yy++) {
         uint32_t c = gradient_color((uint64_t)yy, g_h);
@@ -502,6 +604,20 @@ static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
     if (y1 > work_h()) {
         render_taskbar();
     }
+
+    /* The Start menu floats above everything else when open. */
+    if (g_start_menu) {
+        int64_t mx = menu_x();
+        int64_t my = menu_y();
+        if (x < mx + (int64_t)MENU_W && mx < x + w &&
+            y < my + menu_h() && my < y + h) {
+            render_start_menu();
+        }
+    }
+
+    g_bb_clip_active = clip_was_active;
+    g_bb_clip_x0 = sx0; g_bb_clip_y0 = sy0;
+    g_bb_clip_x1 = sx1; g_bb_clip_y1 = sy1;
 }
 
 static int win_rect_intersects(const struct desktop_window *win,
@@ -683,6 +799,316 @@ static void render_clock(void) {
               (int64_t)tw + 2 * pad, TASKBAR_H - 8);
 }
 
+/* ---- Start menu ---- */
+
+static int menu_x(void) { return 8; }
+
+static int menu_h(void) {
+    return (int)(MENU_PAD * 2 + ICON_COUNT * MENU_ITEM_H);
+}
+
+static int menu_y(void) { return (int)work_h() - menu_h() - 4; }
+
+static void render_start_menu(void) {
+    int64_t mx = menu_x();
+    int64_t my = menu_y();
+    bb_fill_rect(mx, my, MENU_W, menu_h(), TASKBAR_BG);
+    bb_draw_rect(mx, my, MENU_W, menu_h(), WIN_BORDER);
+
+    for (unsigned i = 0; i < ICON_COUNT; i++) {
+        int64_t iy = my + MENU_PAD + (int64_t)i * MENU_ITEM_H;
+        bb_fill_rect(mx + MENU_PAD, iy, MENU_W - 2 * MENU_PAD,
+                     MENU_ITEM_H - 6, TASKBAR_BTN_BG);
+        int64_t ty = iy + (MENU_ITEM_H - 6 - FONT_H) / 2;
+        bb_draw_char(mx + MENU_PAD + 8, ty, g_icons[i].glyph, 0x00FFFFFFu);
+        bb_draw_string(mx + MENU_PAD + 30, ty, g_icons[i].label, CLOCK_TEXT);
+    }
+}
+
+static void close_start_menu(void) {
+    if (!g_start_menu) return;
+    g_start_menu = 0;
+    redraw_rect(menu_x(), menu_y(), MENU_W, menu_h());
+}
+
+static void open_start_menu(void) {
+    if (g_start_menu) return;
+    g_start_menu = 1;
+    redraw_rect(menu_x(), menu_y(), MENU_W, menu_h());
+}
+
+/* ---- terminal application ---- */
+
+static void sys_reboot(void) {
+    /* PS/2 controller reset pulse: asks the machine to reboot. */
+    klog("[terminal] reboot requested\n");
+    __asm__ volatile ("cli");
+    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
+    for (;;) { __asm__ volatile ("hlt"); }
+}
+
+static char *ul_to_str(unsigned long v, char *dst) {
+    char tmp[24];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0 && n < 22) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n > 0) *dst++ = tmp[--n];
+    *dst = 0;
+    return dst;
+}
+
+static void term_append_line(struct desktop_window *w, const char *s) {
+    if (w->term_len >= TERM_SCROLL_MAX) {
+        memmove(w->term_lines[0], w->term_lines[1],
+                (size_t)(TERM_SCROLL_MAX - 1) * TERM_LINE_MAX);
+        w->term_len = TERM_SCROLL_MAX - 1;
+    }
+    char *dst = w->term_lines[w->term_len];
+    int n = 0;
+    while (s != NULL && *s && n < TERM_LINE_MAX - 1) { dst[n++] = *s++; }
+    dst[n] = 0;
+    w->term_len++;
+    w->term_scroll = 0;   /* new output pulls the view back to the bottom */
+}
+
+static void term_print(struct desktop_window *w, const char *s) {
+    term_append_line(w, s);
+}
+
+static void term_print_time(struct desktop_window *w) {
+    struct rtc_datetime dt;
+    char buf[24];
+    if (!rtc_read(&dt)) {
+        term_print(w, "Time: --:--:--");
+        return;
+    }
+    size_t i = 0;
+    buf[i++] = 'T'; buf[i++] = 'i'; buf[i++] = 'm'; buf[i++] = 'e';
+    buf[i++] = ':'; buf[i++] = ' ';
+    put_digits(buf, &i, dt.hour, 2);   buf[i++] = ':';
+    put_digits(buf, &i, dt.minute, 2); buf[i++] = ':';
+    put_digits(buf, &i, dt.second, 2);
+    buf[i] = 0;
+    term_print(w, buf);
+}
+
+static void term_print_date(struct desktop_window *w) {
+    struct rtc_datetime dt;
+    char buf[32];
+    if (!rtc_read(&dt)) {
+        term_print(w, "Date: --/--/----");
+        return;
+    }
+    const char *m = (dt.month >= 1 && dt.month <= 12) ? g_months[dt.month - 1] : "???";
+    size_t i = 0;
+    buf[i++] = 'D'; buf[i++] = 'a'; buf[i++] = 't'; buf[i++] = 'e';
+    buf[i++] = ':'; buf[i++] = ' ';
+    while (*m) buf[i++] = *m++;
+    buf[i++] = ' ';
+    put_digits(buf, &i, dt.day, 2);
+    buf[i++] = ',';
+    buf[i++] = ' ';
+    put_digits(buf, &i, dt.year, 4);
+    buf[i] = 0;
+    term_print(w, buf);
+}
+
+static void term_print_mem(struct desktop_window *w) {
+    char buf[96];
+    char *p = buf;
+    const char *pre = "Heap: ";
+    while (*pre) *p++ = *pre++;
+    p = ul_to_str(kheap_used_bytes() / 1024, p);
+    const char *mid = " KiB used, ";
+    while (*mid) *p++ = *mid++;
+    p = ul_to_str(kheap_free_bytes() / 1024, p);
+    const char *post = " KiB free";
+    while (*post) *p++ = *post++;
+    *p = 0;
+    term_print(w, buf);
+}
+
+static void term_exec(struct desktop_window *w) {
+    char echo[TERM_LINE_MAX];
+    char cmd[TERM_LINE_MAX];
+
+    /* Echo the command line (prompt + typed text) into the scrollback. */
+    int n = 0;
+    const char *pr = TERM_PROMPT;
+    while (*pr && n < TERM_LINE_MAX - 1) echo[n++] = *pr++;
+    for (int i = 0; i < w->term_input_len && n < TERM_LINE_MAX - 1; i++) {
+        echo[n++] = w->term_input[i];
+    }
+    echo[n] = 0;
+    term_append_line(w, echo);
+
+    int cl = w->term_input_len;
+    if (cl > TERM_LINE_MAX - 1) cl = TERM_LINE_MAX - 1;
+    for (int i = 0; i < cl; i++) cmd[i] = w->term_input[i];
+    cmd[cl] = 0;
+
+    w->term_input[0] = 0;
+    w->term_input_len = 0;
+    w->term_cursor_col = 0;
+
+    klog("[terminal] exec: '%s'\n", cmd);
+
+    char *args = cmd;
+    while (*args == ' ') args++;
+    if (*args == 0) return;
+
+    char *tok = args;
+    int ti = 0;
+    while (args[ti] != 0 && args[ti] != ' ') ti++;
+    int tok_len = ti;
+    while (args[ti] == ' ') ti++;
+    const char *rest = &args[ti];
+
+    if (tok_len == 4 && memcmp(tok, "help", 4) == 0) {
+        term_print(w, "Commands: help, clear, about, echo,");
+        term_print(w, "time, date, mem, reboot.");
+        return;
+    }
+    if (tok_len == 5 && memcmp(tok, "clear", 5) == 0) {
+        w->term_len = 0;
+        w->term_scroll = 0;
+        return;
+    }
+    if (tok_len == 5 && memcmp(tok, "about", 5) == 0) {
+        term_print(w, "Sol OS");
+        term_print(w, "Version 0.1");
+        term_print(w, "Architecture: x86_64");
+        term_print(w, "Resolution: 1920x1080");
+        term_print(w, "Bootloader: Limine");
+        return;
+    }
+    if (tok_len == 4 && memcmp(tok, "echo", 4) == 0) {
+        if (rest[0]) term_print(w, rest);
+        return;
+    }
+    if (tok_len == 4 && memcmp(tok, "time", 4) == 0) {
+        term_print_time(w);
+        return;
+    }
+    if (tok_len == 4 && memcmp(tok, "date", 4) == 0) {
+        term_print_date(w);
+        return;
+    }
+    if (tok_len == 3 && memcmp(tok, "mem", 3) == 0) {
+        term_print_mem(w);
+        return;
+    }
+    if (tok_len == 6 && memcmp(tok, "reboot", 6) == 0) {
+        term_print(w, "Rebooting...");
+        sys_reboot();
+        return;
+    }
+    term_print(w, "Unknown command. Type 'help'.");
+}
+
+static void term_feed(struct desktop_window *w, unsigned char c) {
+    if (c >= 0x20 && c <= 0x7E) {
+        if (w->term_input_len < TERM_LINE_MAX - 1) {
+            if (w->term_cursor_col < w->term_input_len) {
+                memmove(&w->term_input[w->term_cursor_col + 1],
+                        &w->term_input[w->term_cursor_col],
+                        (size_t)(w->term_input_len - w->term_cursor_col));
+            }
+            w->term_input[w->term_cursor_col] = (char)c;
+            w->term_input_len++;
+            w->term_cursor_col++;
+        }
+        return;
+    }
+    if (c == 8) {   /* backspace */
+        if (w->term_cursor_col > 0) {
+            if (w->term_cursor_col < w->term_input_len) {
+                memmove(&w->term_input[w->term_cursor_col - 1],
+                        &w->term_input[w->term_cursor_col],
+                        (size_t)(w->term_input_len - w->term_cursor_col));
+            }
+            w->term_cursor_col--;
+            w->term_input_len--;
+            w->term_input[w->term_input_len] = 0;
+        }
+        return;
+    }
+    if (c == 10) {   /* enter */
+        term_exec(w);
+        return;
+    }
+    if (c == 0x01 || c == 0x05) {   /* page up / up: scroll back */
+        w->term_scroll++;
+        if (w->term_scroll > w->term_len) w->term_scroll = w->term_len;
+        return;
+    }
+    if (c == 0x02 || c == 0x06) {   /* page down / down: scroll forward */
+        if (w->term_scroll > 0) w->term_scroll--;
+        return;
+    }
+    if (c == 0x03) {   /* cursor left */
+        if (w->term_cursor_col > 0) w->term_cursor_col--;
+        return;
+    }
+    if (c == 0x04) {   /* cursor right */
+        if (w->term_cursor_col < w->term_input_len) w->term_cursor_col++;
+        return;
+    }
+}
+
+static void term_render(struct desktop_window *w, int active) {
+    int64_t bx = w->x + 1;
+    int64_t by = w->y + 1 + TITLE_H;
+    int64_t bw = w->w - 2;
+    int64_t bh = w->h - 2 - TITLE_H;
+    bb_fill_rect(bx, by, bw, bh, TERM_BG);
+
+    int64_t rows = (bh - 2) / TERM_ROW_H;
+    if (rows < 2) rows = 2;
+    int64_t cols = (bw - 8) / FONT_W;
+    if (cols < 8) cols = 8;
+    if (cols > TERM_LINE_MAX - 1) cols = TERM_LINE_MAX - 1;
+
+    int64_t tx = bx + 4;
+    int64_t ty = by + 2;
+
+    int64_t sb = rows - 1;
+    int64_t start = w->term_len - sb - w->term_scroll;
+    if (start < 0) start = 0;
+
+    for (int64_t i = 0; i < sb; i++) {
+        int64_t ly = ty + i * TERM_ROW_H;
+        const char *s = w->term_lines[start + i];
+        int64_t x = tx;
+        for (int k = 0; k < cols && s[k]; k++) {
+            bb_draw_char(x, ly, s[k], TERM_TEXT);
+            x += FONT_W;
+        }
+    }
+
+    /* input row with prompt, typed text, and the (blinking) cursor */
+    int64_t iy = ty + sb * TERM_ROW_H;
+    int64_t x = tx;
+    int ncells = 0;
+    const char *pr = TERM_PROMPT;
+    while (*pr && ncells < cols) {
+        bb_draw_char(x, iy, *pr, TERM_TEXT);
+        x += FONT_W;
+        pr++;
+        ncells++;
+    }
+    int cursor_cell = ncells;
+    for (int k = 0; k < w->term_input_len && ncells < cols; k++) {
+        bb_draw_char(x, iy, w->term_input[k], TERM_TEXT);
+        x += FONT_W;
+        ncells++;
+    }
+    if (active && (g_last_second & 1u)) {
+        int64_t cx = tx + ((int64_t)cursor_cell + w->term_cursor_col) * FONT_W;
+        bb_fill_rect(cx, iy + FONT_H + 1, FONT_W, 2, TERM_TEXT);
+    }
+}
+
 /* ---- windows (drawing) ---- */
 
 static void win_render(struct desktop_window *w) {
@@ -695,7 +1121,6 @@ static void win_render(struct desktop_window *w) {
 
     bb_draw_rect(x, y, bw, bh, WIN_BORDER);
     bb_fill_rect(x + 1, y + 1, bw - 2, TITLE_H, title_bg);
-    bb_fill_rect(x + 1, y + 1 + TITLE_H, bw - 2, bh - 2 - TITLE_H, BODY_BG);
 
     bb_draw_string(x + 7, y + (TITLE_H - FONT_H) / 2, w->title, title_tx);
 
@@ -719,11 +1144,28 @@ static void win_render(struct desktop_window *w) {
     /* close: x glyph */
     bb_draw_char(c0 + (BTN_W - FONT_W) / 2, by + (BTN_H - FONT_H) / 2, 'x', BTN_GLYPH);
 
+    if (w->kind == 1) {
+        term_render(w, active);
+        return;
+    }
+
+    bb_fill_rect(x + 1, y + 1 + TITLE_H, bw - 2, bh - 2 - TITLE_H, BODY_BG);
+
     int64_t lx = x + 8;
     int64_t ly = y + 1 + TITLE_H + 6;
     for (int li = 0; li < w->nlines && li < (int)MAX_WIN_LINES; li++) {
         bb_draw_string(lx, ly, w->lines[li], BODY_TEXT);
         ly += FONT_H + 4;
+    }
+
+    /* resize grip in the bottom-right corner of a normal (non-maximized)
+     * window; maximized windows cannot be resized */
+    if (!w->maximized) {
+        int64_t gr = x + bw - 12;
+        int64_t gb = y + bh - 12;
+        bb_fill_rect(gr, gb + 8, 10, 2, 0x00C0C8D4u);
+        bb_fill_rect(gr + 4, gb + 4, 10, 2, 0x00C0C8D4u);
+        bb_fill_rect(gr + 8, gb, 10, 2, 0x00C0C8D4u);
     }
 }
 
@@ -734,7 +1176,7 @@ static int win_is_topmost_win(const struct desktop_window *w) {
 /* ---- window ops ---- */
 
 static int win_open(const char *title, int64_t x, int64_t y,
-                    int64_t w, int64_t h,
+                    int64_t w, int64_t h, int kind,
                     const char *const *lines, int nlines) {
     if (x < 0) x = 0;
     if (y < 0) y = 0;
@@ -752,11 +1194,22 @@ static int win_open(const char *title, int64_t x, int64_t y,
         n->w = w;
         n->h = h;
         n->title = title;
-        n->nlines = nlines > (int)MAX_WIN_LINES ? (int)MAX_WIN_LINES : nlines;
-        for (int li = 0; li < n->nlines; li++) n->lines[li] = lines[li];
+        n->kind = kind;
         n->order = ++g_order_counter;
         n->minimized = 0;
         n->maximized = 0;
+        if (kind == 1) {
+            n->term_len = 0;
+            n->term_scroll = 0;
+            n->term_input[0] = 0;
+            n->term_input_len = 0;
+            n->term_cursor_col = 0;
+            term_append_line(n, "Sol OS terminal 0.1");
+            term_append_line(n, "Type 'help' for commands.");
+        } else {
+            n->nlines = nlines > (int)MAX_WIN_LINES ? (int)MAX_WIN_LINES : nlines;
+            for (int li = 0; li < n->nlines; li++) n->lines[li] = lines[li];
+        }
         redraw_all_titles();
         return (int)i;
     }
@@ -782,6 +1235,7 @@ static void win_close(int idx) {
     int64_t x = w->x, y = w->y, bw = w->w, bh = w->h;
     w->used = 0;
     if (g_drag == idx) g_drag = -1;
+    if (g_resize == idx) g_resize = -1;
     redraw_rect(x, y, bw, bh);
     redraw_all_titles();
     redraw_taskbar();
@@ -794,6 +1248,7 @@ static void win_minimize(int idx) {
     int64_t x = w->x, y = w->y, bw = w->w, bh = w->h;
     w->minimized = 1;
     if (g_drag == idx) g_drag = -1;
+    if (g_resize == idx) g_resize = -1;
     redraw_rect(x, y, bw, bh);
     redraw_all_titles();
     redraw_taskbar();
@@ -853,9 +1308,12 @@ static void handle_left_press(int64_t px, int64_t py) {
         /* click in the taskbar strip */
         if (px >= start_x() && px < start_x() + START_W &&
             py >= start_y() && py < start_y() + START_H) {
-            klog("[desktop] start menu (not yet)\n");
+            klog("[desktop] start button\n");
+            if (g_start_menu) close_start_menu();
+            else open_start_menu();
             return;
         }
+        if (g_start_menu) close_start_menu();
         int wi = taskbar_win_at(px, py);
         if (wi >= 0) {
             klog("[desktop] taskbar '%s'\n", g_wins[wi].title);
@@ -867,6 +1325,19 @@ static void handle_left_press(int64_t px, int64_t py) {
         }
         return;
     }
+
+    /* a click anywhere outside the open Start menu closes it */
+    if (g_start_menu &&
+        px >= menu_x() && px < menu_x() + MENU_W &&
+        py >= menu_y() && py < menu_y() + menu_h()) {
+        int row = (int)((py - menu_y() - MENU_PAD) / MENU_ITEM_H);
+        if (row >= 0 && row < (int)ICON_COUNT) {
+            close_start_menu();
+            icon_open(row);
+        }
+        return;
+    }
+    if (g_start_menu) close_start_menu();
 
     int wi = win_topmost_at(px, py);
     if (wi < 0) {
@@ -893,6 +1364,22 @@ static void handle_left_press(int64_t px, int64_t py) {
     if (btn == 'm') {
         klog("[desktop] min '%s'\n", w->title);
         win_minimize(wi);
+        return;
+    }
+
+    /* bottom-right resize grip of a normal-sized window */
+    if (!w->maximized &&
+        px >= w->x + w->w - RESIZE_GUTTER && px < w->x + w->w &&
+        py >= w->y + w->h - RESIZE_GUTTER && py < w->y + w->h) {
+        win_raise(wi);
+        g_resize = wi;
+        g_drag_off_x = px - w->x;
+        g_drag_off_y = py - w->y;
+        g_resize_x = px;
+        g_resize_y = py;
+        g_resize_w = w->w;
+        g_resize_h = w->h;
+        klog("[desktop] resize '%s'\n", w->title);
         return;
     }
 
@@ -936,6 +1423,7 @@ void desktop_init(struct limine_framebuffer *fb) {
     g_pitch = fb->pitch;
     g_fbaddr = (uint8_t *)fb->address;
     g_drag = -1;
+    g_resize = -1;
 
     if (g_w == 0 || g_h == 0) {
         klog("[desktop] FATAL: zero-size framebuffer\n");
@@ -963,14 +1451,14 @@ void desktop_init(struct limine_framebuffer *fb) {
     gfx_selftest();
 
     static const char *about_lines[] = {
-        "Sol OS desktop is up.",
-        "Mouse: VirtIO (cursor follows it).",
-        "Drag the title bar to move this window.",
-        "Use the buttons to close, maximize,",
-        "or minimize. Click its taskbar button",
-        "to bring it back.",
+        "Welcome to Sol OS!",
+        "Desktop: mouse via VirtIO.",
+        "Drag the title bar to move windows.",
+        "Bottom-right corner resizes windows.",
+        "Start menu: icons and the terminal.",
+        "Terminal: 'help' lists commands.",
     };
-    win_open("About Sol OS", 120, 90, 460, 240, about_lines, 6);
+    win_open("About Sol OS", 120, 90, 460, 240, 0, about_lines, 6);
 
     scene_region(0, 0, (int64_t)g_w, (int64_t)g_h);
     blit_full();
@@ -1006,7 +1494,7 @@ void desktop_poll(void) {
     uint8_t pressed = g_buttons & ~g_buttons_prev;
     uint8_t released = g_buttons_prev & ~g_buttons;
 
-    if (g_drag >= 0 && g_wins[g_drag].used) {
+    if (g_drag >= 0 && g_wins[g_drag].used && (dx != 0 || dy != 0)) {
         struct desktop_window *w = &g_wins[g_drag];
         int64_t ox = w->x, oy = w->y, ow = w->w, oh = w->h;
         if (w->maximized) {
@@ -1029,6 +1517,27 @@ void desktop_poll(void) {
         redraw_taskbar();
     }
 
+    if (g_resize >= 0 && g_wins[g_resize].used) {
+        struct desktop_window *w = &g_wins[g_resize];
+        if (w->maximized) {
+            g_resize = -1;
+        } else {
+            int64_t ox = w->x, oy = w->y, ow = w->w, oh = w->h;
+            int64_t nw = g_resize_w + (g_cursor_x - g_resize_x);
+            int64_t nh = g_resize_h + (g_cursor_y - g_resize_y);
+            if (nw < MIN_WIN_W) nw = MIN_WIN_W;
+            if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+            if (w->x + nw > (int64_t)g_w) nw = (int64_t)g_w - w->x;
+            if (w->y + nh > work_h()) nh = work_h() - w->y;
+            if (nw != ow || nh != oh) {
+                w->w = nw;
+                w->h = nh;
+                redraw_union(ox, oy, ow, oh, w->x, w->y, nw, nh);
+                redraw_taskbar();
+            }
+        }
+    }
+
     if (pressed & 0x01u) {
         handle_left_press(g_cursor_x, g_cursor_y);
     }
@@ -1044,12 +1553,30 @@ void desktop_poll(void) {
     }
     if (released & 0x01u) {
         g_drag = -1;
+        g_resize = -1;
+    }
+
+    /* Keyboard input: forward to the focused terminal window. */
+    char kch;
+    while (virtio_keyboard_read_char(&kch)) {
+        int top = win_topmost_index();
+        if (top < 0) continue;
+        struct desktop_window *w = &g_wins[top];
+        if (!w->used || w->kind != 1) continue;
+        term_feed(w, (unsigned char)kch);
+        redraw_rect(w->x, w->y, w->w, w->h);
     }
 
     uint64_t sec = timer_get_ticks() / 100;
     if (sec != g_last_second) {
         g_last_second = sec;
         render_clock();
+        /* blink the cursor of the focused terminal */
+        int top = win_topmost_index();
+        if (top >= 0 && g_wins[top].used && g_wins[top].kind == 1) {
+            redraw_rect(g_wins[top].x, g_wins[top].y,
+                        g_wins[top].w, g_wins[top].h);
+        }
         if (!desktop_gfx_integrity()) {
             klog("[gfx] INTEGRITY FAILURE at %lu s\n", (unsigned long)sec);
         }
