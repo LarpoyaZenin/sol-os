@@ -278,16 +278,16 @@ static void virtio_input_drain(virtio_input_t *vi) {
     uint32_t len;
     int recycled = 0;
 
-    while (virtio_queue_pop_used(d, &id, &len)) {
+    while (virtio_queue_pop_used(d, 0, &id, &len)) {
         if (id < VIRTIO_INPUT_MAX_QUEUE) {
             virtio_input_handle_event(vi, &vi->events[id], len);
         } else {
             vi->events_dropped++;
         }
-        virtio_queue_recycle(d, id);
+        virtio_queue_recycle(d, 0, id);
         recycled++;
     }
-    if (recycled > 0) virtio_queue_kick(d);
+    if (recycled > 0) virtio_queue_kick(d, 0);
 }
 
 static void virtio_input_irq(void *ctx) {
@@ -349,7 +349,7 @@ uint32_t virtio_input_init(uint64_t hhdm) {
 
         uint16_t size = virtio_queue_size(&vi->vdev, 0);
         if (size > VIRTIO_INPUT_MAX_QUEUE) size = VIRTIO_INPUT_MAX_QUEUE;
-        if (virtio_queue_init(&vi->vdev, size) != 0) {
+        if (virtio_queue_init(&vi->vdev, 0, size) != 0) {
             klog("virtio-input: queue setup failed\n");
             continue;
         }
@@ -363,13 +363,13 @@ uint32_t virtio_input_init(uint64_t hhdm) {
         vi->events = (struct virtio_input_event *)(hhdm + vi->events_phys);
 
         for (uint16_t n = 0; n < size; n++) {
-            if (virtio_queue_add_buffer(&vi->vdev,
+            if (virtio_queue_add_buffer(&vi->vdev, 0,
                                         vi->events_phys + (uintptr_t)n * sizeof(struct virtio_input_event),
                                         sizeof(struct virtio_input_event), 1) != 0) {
                 break;   /* pool exhausted — not expected at setup */
             }
         }
-        virtio_queue_kick(&vi->vdev);
+        virtio_queue_kick(&vi->vdev, 0);
 
         virtio_input_read_name(vi);
 

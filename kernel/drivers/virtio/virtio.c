@@ -219,113 +219,171 @@ uint16_t virtio_queue_size(struct virtio_device *d, uint16_t queue_index) {
  * physical page per region suffices and keeps the rings page-aligned. */
 #define VIRTIO_MAX_QUEUE_SIZE 256u
 
-int virtio_queue_init(struct virtio_device *d, uint16_t queue_size) {
+static int virtio_queue_init_one(struct virtio_device *d, uint16_t qidx,
+                                 uint16_t queue_size) {
+    if (qidx >= VIRTIO_MAX_QUEUES) return -1;
+    struct virtio_vq *vq = &d->vq[qidx];
+
     if (queue_size < 2) {
-        klog("virtio: device offered an unusable queue size (%u)\n", queue_size);
+        klog("virtio: queue %u: device offered an unusable size (%u)\n",
+             qidx, queue_size);
         return -1;
     }
     if (queue_size > VIRTIO_MAX_QUEUE_SIZE) queue_size = VIRTIO_MAX_QUEUE_SIZE;
 
-    d->vq.desc_phys  = pmm_alloc_page();
-    d->vq.avail_phys = pmm_alloc_page();
-    d->vq.used_phys  = pmm_alloc_page();
-    if (d->vq.desc_phys == 0 || d->vq.avail_phys == 0 || d->vq.used_phys == 0) {
-        klog("virtio: out of memory for virtqueue\n");
-        if (d->vq.desc_phys  != 0) pmm_free_page(d->vq.desc_phys);
-        if (d->vq.avail_phys != 0) pmm_free_page(d->vq.avail_phys);
-        if (d->vq.used_phys  != 0) pmm_free_page(d->vq.used_phys);
-        d->vq.desc_phys = d->vq.avail_phys = d->vq.used_phys = 0;
+    vq->desc_phys  = pmm_alloc_page();
+    vq->avail_phys = pmm_alloc_page();
+    vq->used_phys  = pmm_alloc_page();
+    if (vq->desc_phys == 0 || vq->avail_phys == 0 || vq->used_phys == 0) {
+        klog("virtio: queue %u: out of memory for virtqueue\n", qidx);
+        if (vq->desc_phys  != 0) pmm_free_page(vq->desc_phys);
+        if (vq->avail_phys != 0) pmm_free_page(vq->avail_phys);
+        if (vq->used_phys  != 0) pmm_free_page(vq->used_phys);
+        vq->desc_phys = vq->avail_phys = vq->used_phys = 0;
         return -1;
     }
 
-    d->vq.queue_size = queue_size;
-    d->vq.desc  = (struct virtq_desc *)(d->hhdm + d->vq.desc_phys);
-    d->vq.avail = (struct virtq_avail *)(d->hhdm + d->vq.avail_phys);
-    d->vq.used  = (struct virtq_used *)(d->hhdm + d->vq.used_phys);
+    vq->queue_size = queue_size;
+    vq->desc  = (struct virtq_desc *)(d->hhdm + vq->desc_phys);
+    vq->avail = (struct virtq_avail *)(d->hhdm + vq->avail_phys);
+    vq->used  = (struct virtq_used *)(d->hhdm + vq->used_phys);
 
     /* Link every descriptor into the free pool. */
     for (uint16_t i = 0; i < queue_size; i++) {
-        d->vq.desc[i].next = (uint16_t)(i + 1);
+        vq->desc[i].next = (uint16_t)(i + 1);
     }
-    d->vq.desc[queue_size - 1].next = 0;
-    d->vq.free_head = 0;
-    d->vq.free_count = queue_size;
-    d->vq.avail_idx = 0;
-    d->vq.used_idx = 0;
-    d->vq.avail->flags = 0;
-    d->vq.avail->idx = 0;
-    d->vq.used->flags = 0;
-    d->vq.used->idx = 0;
+    vq->desc[queue_size - 1].next = 0;
+    vq->free_head = 0;
+    vq->free_count = queue_size;
+    vq->avail_idx = 0;
+    vq->used_idx = 0;
+    vq->avail->flags = 0;
+    vq->avail->idx = 0;
+    vq->used->flags = 0;
+    vq->used->idx = 0;
 
     /* Program the device. */
-    mmio_write16(d->common, CC_QUEUE_SELECT, 0);
+    mmio_write16(d->common, CC_QUEUE_SELECT, qidx);
     mmio_write16(d->common, CC_QUEUE_SIZE, queue_size);
-    mmio_write32(d->common, CC_QUEUE_DESC,     (uint32_t)d->vq.desc_phys);
-    mmio_write32(d->common, CC_QUEUE_DESC + 4, (uint32_t)(d->vq.desc_phys >> 32));
-    mmio_write32(d->common, CC_QUEUE_DRIVER,     (uint32_t)d->vq.avail_phys);
-    mmio_write32(d->common, CC_QUEUE_DRIVER + 4, (uint32_t)(d->vq.avail_phys >> 32));
-    mmio_write32(d->common, CC_QUEUE_DEVICE,     (uint32_t)d->vq.used_phys);
-    mmio_write32(d->common, CC_QUEUE_DEVICE + 4, (uint32_t)(d->vq.used_phys >> 32));
+    mmio_write32(d->common, CC_QUEUE_DESC,     (uint32_t)vq->desc_phys);
+    mmio_write32(d->common, CC_QUEUE_DESC + 4, (uint32_t)(vq->desc_phys >> 32));
+    mmio_write32(d->common, CC_QUEUE_DRIVER,     (uint32_t)vq->avail_phys);
+    mmio_write32(d->common, CC_QUEUE_DRIVER + 4, (uint32_t)(vq->avail_phys >> 32));
+    mmio_write32(d->common, CC_QUEUE_DEVICE,     (uint32_t)vq->used_phys);
+    mmio_write32(d->common, CC_QUEUE_DEVICE + 4, (uint32_t)(vq->used_phys >> 32));
 
     uint16_t notify_off = mmio_read16(d->common, CC_QUEUE_NOTIFY_OFF);
-    d->vq.notify_addr = (uintptr_t)d->notify + (uintptr_t)notify_off * d->notify_off_multiplier;
+    vq->notify_addr = (uintptr_t)d->notify + (uintptr_t)notify_off * d->notify_off_multiplier;
 
     mmio_write16(d->common, CC_QUEUE_ENABLE, 1);
 
     uint16_t accepted = mmio_read16(d->common, CC_QUEUE_SIZE);
     if (accepted < queue_size) {
-        klog("virtio: device accepted a smaller queue (%u < %u)\n", accepted, queue_size);
-        d->vq.queue_size = accepted;
+        klog("virtio: queue %u: device accepted a smaller size (%u < %u)\n",
+             qidx, accepted, queue_size);
+        vq->queue_size = accepted;
     }
 
-    klog("virtio: queue %u descs (device accepted %u) notify_off=%u\n",
-         queue_size, d->vq.queue_size, notify_off);
+    klog("virtio: queue %u: %u descs (accepted %u) notify_off=%u\n",
+         qidx, queue_size, vq->queue_size, notify_off);
     return 0;
 }
 
-int virtio_queue_add_buffer(struct virtio_device *d, uintptr_t phys, uint32_t len, int device_writes) {
-    if (d->vq.free_count == 0) return -1;
+int virtio_queue_init(struct virtio_device *d, uint16_t queue_index, uint16_t queue_size) {
+    return virtio_queue_init_one(d, queue_index, queue_size);
+}
 
-    uint16_t id = d->vq.free_head;
-    d->vq.free_head = d->vq.desc[id].next;
-    d->vq.free_count--;
+int virtio_queue_add_buffer(struct virtio_device *d, uint16_t queue_index,
+                            uintptr_t phys, uint32_t len, int device_writes) {
+    uint16_t id;
+    return virtio_queue_add_buffer_id(d, queue_index, phys, len, device_writes, &id);
+}
 
-    d->vq.desc[id].addr  = phys;
-    d->vq.desc[id].len   = len;
-    d->vq.desc[id].flags = device_writes ? VIRTQ_DESC_F_WRITE : 0u;
-    d->vq.desc[id].next  = 0;
+int virtio_queue_add_buffer_id(struct virtio_device *d, uint16_t queue_index,
+                               uintptr_t phys, uint32_t len, int device_writes,
+                               uint16_t *out_id) {
+    if (virtio_queue_alloc_desc(d, queue_index, out_id) != 0) return -1;
+    virtio_queue_desc_fill(d, queue_index, *out_id, phys, len, device_writes);
+    virtio_queue_submit(d, queue_index, *out_id);
+    return 0;
+}
 
-    d->vq.avail->ring[d->vq.avail_idx % d->vq.queue_size] = id;
+int virtio_queue_alloc_desc(struct virtio_device *d, uint16_t queue_index, uint16_t *out_id) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return -1;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (vq->free_count == 0) return -1;
+
+    uint16_t id = vq->free_head;
+    vq->free_head = vq->desc[id].next;
+    vq->free_count--;
+    if (out_id != NULL) *out_id = id;
+    return 0;
+}
+
+void virtio_queue_desc_fill(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id,
+                            uintptr_t phys, uint32_t len, int device_writes) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (desc_id >= vq->queue_size) return;
+
+    vq->desc[desc_id].addr  = phys;
+    vq->desc[desc_id].len   = len;
+    vq->desc[desc_id].flags = device_writes ? VIRTQ_DESC_F_WRITE : 0u;
+    vq->desc[desc_id].next  = 0;
+}
+
+void virtio_queue_submit(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (desc_id >= vq->queue_size) return;
+
+    vq->avail->ring[vq->avail_idx % vq->queue_size] = desc_id;
     __asm__ volatile ("" ::: "memory");     /* ring entry before idx */
-    d->vq.avail_idx++;
-    d->vq.avail->idx = d->vq.avail_idx;
-    return 0;
+    vq->avail_idx++;
+    vq->avail->idx = vq->avail_idx;
 }
 
-void virtio_queue_recycle(struct virtio_device *d, uint16_t desc_id) {
-    if (desc_id >= d->vq.queue_size) return;
+void virtio_queue_free_desc(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (desc_id >= vq->queue_size) return;
 
-    d->vq.avail->ring[d->vq.avail_idx % d->vq.queue_size] = desc_id;
+    vq->desc[desc_id].next = vq->free_head;
+    vq->free_head = desc_id;
+    vq->free_count++;
+}
+
+void virtio_queue_recycle(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (desc_id >= vq->queue_size) return;
+
+    vq->avail->ring[vq->avail_idx % vq->queue_size] = desc_id;
     __asm__ volatile ("" ::: "memory");
-    d->vq.avail_idx++;
-    d->vq.avail->idx = d->vq.avail_idx;
+    vq->avail_idx++;
+    vq->avail->idx = vq->avail_idx;
 }
 
-int virtio_queue_pop_used(struct virtio_device *d, uint16_t *desc_id, uint32_t *len) {
-    if (d->vq.used_idx == d->vq.used->idx) return 0;   /* nothing new */
-    __asm__ volatile ("" ::: "memory");                /* element visible once idx moves */
+int virtio_queue_pop_used(struct virtio_device *d, uint16_t queue_index,
+                          uint16_t *desc_id, uint32_t *len) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return 0;
+    struct virtio_vq *vq = &d->vq[queue_index];
+    if (vq->used_idx == vq->used->idx) return 0;   /* nothing new */
+    __asm__ volatile ("" ::: "memory");            /* element visible once idx moves */
 
-    const struct virtq_used_elem *e = &d->vq.used->ring[d->vq.used_idx % d->vq.queue_size];
+    const struct virtq_used_elem *e = &vq->used->ring[vq->used_idx % vq->queue_size];
     *desc_id = e->id;
     *len = e->len;
-    d->vq.used_idx++;
+    vq->used_idx++;
     return 1;
 }
 
-void virtio_queue_kick(struct virtio_device *d) {
+void virtio_queue_kick(struct virtio_device *d, uint16_t queue_index) {
+    if (queue_index >= VIRTIO_MAX_QUEUES) return;
+    struct virtio_vq *vq = &d->vq[queue_index];
     /* Ensure the available-ring update is visible before the MMIO
      * notification. mfence is the safe choice here even though the
      * codebase otherwise avoids SSE-generated code. */
     __asm__ volatile ("mfence" ::: "memory");
-    *(volatile uint16_t *)d->vq.notify_addr = 0;
+    *(volatile uint16_t *)vq->notify_addr = 0;
 }

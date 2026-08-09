@@ -64,6 +64,25 @@ struct virtq_used {
     struct virtq_used_elem ring[];
 };
 
+struct virtio_vq {
+    uint16_t queue_size;
+    uint16_t free_head;    /* head of unused-descriptor pool */
+    uint16_t free_count;
+    uint16_t avail_idx;    /* free-running available-ring index */
+    uint16_t used_idx;     /* next used element to consume */
+
+    struct virtq_desc  *desc;
+    struct virtq_avail *avail;
+    struct virtq_used  *used;
+
+    uintptr_t desc_phys, avail_phys, used_phys;
+    uintptr_t notify_addr;
+};
+
+/* Maximum number of virtqueues a driver may set up (virtio-net uses
+ * two: RX at index 0 and TX at index 1). */
+#define VIRTIO_MAX_QUEUES 4u
+
 struct virtio_device {
     uintptr_t hhdm;
     uint8_t bus, dev, func;
@@ -78,20 +97,7 @@ struct virtio_device {
     uint32_t device_features_lo, device_features_hi;
     uint32_t driver_features_lo, driver_features_hi;
 
-    struct {
-        uint16_t queue_size;
-        uint16_t free_head;    /* head of unused-descriptor pool */
-        uint16_t free_count;
-        uint16_t avail_idx;    /* free-running available-ring index */
-        uint16_t used_idx;     /* next used element to consume */
-
-        struct virtq_desc  *desc;
-        struct virtq_avail *avail;
-        struct virtq_used  *used;
-
-        uintptr_t desc_phys, avail_phys, used_phys;
-        uintptr_t notify_addr;
-    } vq;
+    struct virtio_vq vq[VIRTIO_MAX_QUEUES];
 };
 
 /* Locates the four capability regions on the given PCI function,
@@ -125,26 +131,53 @@ static inline void virtio_device_cfg_write8(struct virtio_device *d, uint32_t of
 /* Queue size the device advertises for `queue_index`. */
 uint16_t virtio_queue_size(struct virtio_device *d, uint16_t queue_index);
 
-/* Allocates and programs the (single) virtqueue for the device and
+/* Allocates and programs virtqueue `queue_index` for the device and
  * enables it. queue_size is clamped to what the device offered.
  * Returns 0 on success. */
-int virtio_queue_init(struct virtio_device *d, uint16_t queue_size);
+int virtio_queue_init(struct virtio_device *d, uint16_t queue_index, uint16_t queue_size);
 
-/* Publishes one descriptor to the available ring. `phys` is the
- * guest-physical address of the buffer; `device_writes` marks it
- * write-only for the device (input event buffers). Returns 0 on
- * success, -1 if the descriptor pool is empty. */
-int virtio_queue_add_buffer(struct virtio_device *d, uintptr_t phys, uint32_t len, int device_writes);
+/* Publishes one descriptor to the available ring of `queue_index`.
+ * `phys` is the guest-physical address of the buffer;
+ * `device_writes` marks it write-only for the device (input event
+ * buffers, NIC RX buffers). Returns 0 on success, -1 if the
+ * descriptor pool is empty. */
+int virtio_queue_add_buffer(struct virtio_device *d, uint16_t queue_index,
+                            uintptr_t phys, uint32_t len, int device_writes);
 
-/* Re-publishes a descriptor that was returned on the used ring,
- * recycling it without touching its address/len/flags. */
-void virtio_queue_recycle(struct virtio_device *d, uint16_t desc_id);
+/* Like virtio_queue_add_buffer, but also returns the descriptor id
+ * used in *out_id so the driver can correlate completions (used by
+ * virtio-net TX, which returns descriptors to the pool once the
+ * device has finished with them). */
+int virtio_queue_add_buffer_id(struct virtio_device *d, uint16_t queue_index,
+                               uintptr_t phys, uint32_t len, int device_writes,
+                               uint16_t *out_id);
 
-/* Returns 1 and fills *desc_id and *len with the next used element,
- * or 0 if none is available yet. */
-int virtio_queue_pop_used(struct virtio_device *d, uint16_t *desc_id, uint32_t *len);
+/* Returns descriptor `desc_id` of `queue_index` to the free pool so
+ * it can be handed out again. Use this instead of
+ * virtio_queue_recycle when the descriptor must not be re-submitted
+ * to the available ring (virtio-net TX: the packet is done, its
+ * buffer must not be transmitted again). */
+void virtio_queue_free_desc(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id);
 
-/* Notifies the device that the available ring has advanced. */
-void virtio_queue_kick(struct virtio_device *d);
+/* Lower-level building blocks used by drivers that must copy data
+ * into a buffer before the descriptor's address is published (e.g.
+ * virtio-net TX): reserve a descriptor, fill it, then publish it. */
+int  virtio_queue_alloc_desc(struct virtio_device *d, uint16_t queue_index, uint16_t *out_id);
+void virtio_queue_desc_fill(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id,
+                            uintptr_t phys, uint32_t len, int device_writes);
+void virtio_queue_submit(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id);
+
+/* Re-publishes a descriptor from `queue_index` that was returned on
+ * the used ring, recycling it without touching its address/len/flags. */
+void virtio_queue_recycle(struct virtio_device *d, uint16_t queue_index, uint16_t desc_id);
+
+/* Returns 1 and fills *desc_id and *len with the next used element
+ * from `queue_index`, or 0 if none is available yet. */
+int virtio_queue_pop_used(struct virtio_device *d, uint16_t queue_index,
+                          uint16_t *desc_id, uint32_t *len);
+
+/* Notifies the device that queue `queue_index`'s available ring has
+ * advanced. */
+void virtio_queue_kick(struct virtio_device *d, uint16_t queue_index);
 
 #endif /* SOL_VIRTIO_H */
