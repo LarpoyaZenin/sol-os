@@ -6,6 +6,7 @@
 #include "arch/x86_64/timer.h"
 #include "arch/x86_64/rtc.h"
 #include "drivers/virtio/virtio_input.h"
+#include "netstack.h"
 #include "string.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +38,9 @@
 
 /* Bottom-right corner grab area for window resizing. */
 #define RESIZE_GUTTER 18
+
+/* Fetched-page buffer for the browser (headers stripped). */
+#define BR_WEB_MAX 8192
 
 /* Start menu geometry. The menu pops up above the Start button, left
  * aligned with it, with one row per desktop app. */
@@ -138,6 +142,16 @@ struct desktop_window {
     char term_input[TERM_LINE_MAX];
     int term_input_len;
     int term_cursor_col;
+    char br_input[TERM_LINE_MAX];  /* browser address-bar text */
+    int br_input_len;
+    int br_cursor_col;
+    int br_page;                      /* BR_PAGE_*: which page is shown */
+    int br_site_kind;                 /* BR_SITE_*: which site mock */
+    char br_site_name[TERM_LINE_MAX]; /* domain or search query */
+    char br_title[TERM_LINE_MAX];     /* tab title text */
+    char br_web[BR_WEB_MAX];          /* fetched page text (body) */
+    int br_web_len;                   /* bytes of body in br_web */
+    int br_web_state;                 /* BR_WEB_*: fetch state */
 };
 
 static struct desktop_window g_wins[MAX_WINDOWS];
@@ -1203,6 +1217,204 @@ static void term_render(struct desktop_window *w, int active) {
     }
 }
 
+/* ---- browser input ---- */
+
+/* Page kinds for the browser content area. */
+#define BR_PAGE_HOME   0
+#define BR_PAGE_SITE   1
+#define BR_PAGE_SEARCH 2
+
+/* Which mock site is shown for BR_PAGE_SITE. */
+#define BR_SITE_GENERIC 0
+#define BR_SITE_YOUTUBE 1
+#define BR_SITE_GOOGLE  2
+
+/* Fetch state for real (non-mock) browser pages. */
+#define BR_WEB_IDLE 0
+#define BR_WEB_BUSY 1
+#define BR_WEB_OK   2
+#define BR_WEB_ERR  3
+
+/* Known-site table: a bare word ("youtube") or its domain both reach
+ * the same mock page. Everything else becomes a search query. */
+struct br_site_def {
+    const char *word;
+    const char *domain;
+    const char *title;
+    int kind;
+};
+
+static const struct br_site_def br_sites[] = {
+    { "youtube", "youtube.com", "YouTube", BR_SITE_YOUTUBE },
+    { "google",  "google.com",  "Google",  BR_SITE_GOOGLE  },
+};
+
+/* Bounded copy; always NUL-terminates dst. */
+static void br_copy(char *dst, size_t n, const char *src) {
+    size_t i = 0;
+    while (src[i] && i + 1 < n) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+/* 1 if s starts with the literal prefix pfx. */
+static int br_prefix(const char *s, const char *pfx) {
+    while (*pfx) { if (*s++ != *pfx++) return 0; }
+    return 1;
+}
+
+/* Puts a short error message into the fetched-page buffer. */
+static void br_web_set_err(struct desktop_window *w, const char *msg) {
+    static const char pre[] = "Could not load the page: ";
+    size_t i = 0;
+    for (size_t k = 0; k < sizeof(pre) - 1 && i < BR_WEB_MAX - 1; k++)
+        w->br_web[i++] = pre[k];
+    for (const char *m = msg; *m && i < BR_WEB_MAX - 1; m++)
+        w->br_web[i++] = *m;
+    w->br_web[i] = 0;
+    w->br_web_len = (int)i;
+    w->br_web_state = BR_WEB_ERR;
+}
+
+/* Completion callback from the netstack: the page body now lives at the
+ * front of w->br_web (headers stripped), or an error message does. */
+static void br_web_done(void *ctx, int status, size_t off, size_t len) {
+    struct desktop_window *w = (struct desktop_window *)ctx;
+    if (!w->used) return;
+    if (status == NS_OK && off <= BR_WEB_MAX) {
+        memmove(w->br_web, w->br_web + off, len);
+        w->br_web_len = (int)len;
+        if (w->br_web_len < BR_WEB_MAX) w->br_web[w->br_web_len] = 0;
+        w->br_web_state = BR_WEB_OK;
+    } else {
+        switch (status) {
+        case NS_ERR_NONET: br_web_set_err(w, "no network device."); break;
+        case NS_ERR_DNS:   br_web_set_err(w, "could not resolve the host name."); break;
+        case NS_ERR_CONN:  br_web_set_err(w, "connection failed or timed out."); break;
+        case NS_ERR_HTTP:  br_web_set_err(w, "the server returned an error."); break;
+        default:           br_web_set_err(w, "request aborted."); break;
+        }
+    }
+    redraw_rect(w->x, w->y, w->w, w->h);
+}
+
+/* Navigates the browser to whatever the address bar holds: a URL-like
+ * string (no spaces) opens a site page, otherwise the text becomes a
+ * search query. "youtube"/"google" (bare or with a domain) map to the
+ * mock site pages. */
+static void br_navigate(struct desktop_window *w) {
+    size_t n = (size_t)w->br_input_len;
+    int has_print = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (w->br_input[i] != ' ' && w->br_input[i] != '\t') { has_print = 1; break; }
+    }
+    if (!has_print) return;
+
+    /* Lowercase the input, dropping trailing whitespace. */
+    char tok[TERM_LINE_MAX];
+    size_t ti = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = w->br_input[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        tok[ti++] = c;
+    }
+    while (ti > 0 && (tok[ti - 1] == ' ' || tok[ti - 1] == '\t')) ti--;
+    tok[ti] = 0;
+
+    /* A URL has no inner spaces; strip scheme + www and take the domain. */
+    const char *s = tok;
+    if (br_prefix(s, "http://")) s += 7;
+    else if (br_prefix(s, "https://")) s += 8;
+    int has_space = 0;
+    for (const char *q = s; *q; q++) if (*q == ' ' || *q == '\t') has_space = 1;
+
+    if (!has_space) {
+        char dom[TERM_LINE_MAX];
+        size_t di = 0;
+        while (*s && di < sizeof(dom) - 1) {
+            if (*s == '/' || *s == '?' || *s == '#') break;
+            dom[di++] = *s++;
+        }
+        dom[di] = 0;
+        if (br_prefix(dom, "www.")) memmove(dom, dom + 4, strlen(dom + 4) + 1);
+
+        w->br_page = BR_PAGE_SITE;
+        w->br_site_kind = BR_SITE_GENERIC;
+        br_copy(w->br_site_name, sizeof w->br_site_name, dom);
+        br_copy(w->br_title, sizeof w->br_title, dom);
+        for (int k = 0; k < (int)(sizeof(br_sites) / sizeof(br_sites[0])); k++) {
+            /* A bare word ("youtube") or its domain ("youtube.com")
+             * both reach the same mock page. */
+            if (strcmp(dom, br_sites[k].domain) == 0 ||
+                strcmp(dom, br_sites[k].word) == 0) {
+                w->br_site_kind = br_sites[k].kind;
+                br_copy(w->br_title, sizeof w->br_title, br_sites[k].title);
+                w->br_web_state = BR_WEB_IDLE;
+                return;
+            }
+        }
+        /* "sol.os" is this machine's virtual home page. */
+        if (strcmp(dom, "sol.os") == 0 || strcmp(dom, "solos") == 0) {
+            w->br_page = BR_PAGE_HOME;
+            br_copy(w->br_title, sizeof w->br_title, "sol.os/home");
+            w->br_web_state = BR_WEB_IDLE;
+            return;
+        }
+        /* Everything else is fetched for real over the SLIRP gateway. */
+        w->br_web_len = 0;
+        w->br_web_state = BR_WEB_BUSY;
+        ns_http_get(dom, "/", w->br_web, sizeof w->br_web, br_web_done, w);
+        return;
+    }
+
+    /* Otherwise treat the whole line as a search query. */
+    w->br_page = BR_PAGE_SEARCH;
+    br_copy(w->br_site_name, sizeof w->br_site_name, s);
+    br_copy(w->br_title, sizeof w->br_title, "Search");
+}
+
+/* Edits the browser's address bar: printable characters insert at the
+ * cursor, backspace deletes, left/right move it, Enter navigates. */
+static void br_feed(struct desktop_window *w, unsigned char c) {
+    if (c >= 0x20 && c <= 0x7E) {
+        if (w->br_input_len < TERM_LINE_MAX - 1) {
+            if (w->br_cursor_col < w->br_input_len) {
+                memmove(&w->br_input[w->br_cursor_col + 1],
+                        &w->br_input[w->br_cursor_col],
+                        (size_t)(w->br_input_len - w->br_cursor_col));
+            }
+            w->br_input[w->br_cursor_col] = (char)c;
+            w->br_input_len++;
+            w->br_cursor_col++;
+        }
+        return;
+    }
+    if (c == 8) {   /* backspace */
+        if (w->br_cursor_col > 0) {
+            if (w->br_cursor_col < w->br_input_len) {
+                memmove(&w->br_input[w->br_cursor_col - 1],
+                        &w->br_input[w->br_cursor_col],
+                        (size_t)(w->br_input_len - w->br_cursor_col));
+            }
+            w->br_cursor_col--;
+            w->br_input_len--;
+            w->br_input[w->br_input_len] = 0;
+        }
+        return;
+    }
+    if (c == 0x03) {   /* cursor left */
+        if (w->br_cursor_col > 0) w->br_cursor_col--;
+        return;
+    }
+    if (c == 0x04) {   /* cursor right */
+        if (w->br_cursor_col < w->br_input_len) w->br_cursor_col++;
+        return;
+    }
+    if (c == 10) {   /* enter: navigate */
+        br_navigate(w);
+        return;
+    }
+}
+
 /* ---- browser homepage ---- */
 
 static const char *g_days_full[7] = {
@@ -1320,6 +1532,297 @@ static void browser_home(int64_t cx, int64_t py, int64_t cw, int64_t ph) {
                    py0 + 10 + FONT_H + 10 + 2 * FONT_H + 14, dbuf, 0x00607080u);
 }
 
+/* ---- browser pages ---- */
+
+/* Word-wraps and draws s within max_w pixels, advancing one line at a
+ * time; returns the new baseline y. */
+static int64_t br_wrap_text(int64_t x, int64_t y, int64_t max_w,
+                            const char *s, uint32_t fg) {
+    int64_t x0 = x;
+    char word[64];
+    size_t wi = 0;
+    for (const char *p = s;; p++) {
+        if (*p == ' ' || *p == 0 || wi == sizeof(word) - 1) {
+            word[wi] = 0;
+            int64_t ww = (int64_t)wi * FONT_W;
+            if (wi > 0 && x - x0 + ww > max_w) {
+                x = x0;
+                y += FONT_H + 2;
+            }
+            if (wi > 0) bb_draw_string(x, y, word, fg);
+            x += ww + FONT_W;
+            wi = 0;
+            if (*p == 0) break;
+        } else {
+            word[wi++] = *p;
+        }
+    }
+    return y;
+}
+
+/* Renders a real fetched page: a status banner on top, then the body
+ * text with HTML tags and entities stripped and words wrapped. */
+static void browser_web(int64_t cx, int64_t py, int64_t cw, int64_t ph,
+                        const struct desktop_window *w) {
+    static char text[BR_WEB_MAX];
+    (void)ph;
+
+    char banner[TERM_LINE_MAX + 24];
+    size_t bi = 0;
+    if (w->br_web_state == BR_WEB_BUSY) {
+        static const char pre[] = "Loading http://";
+        for (size_t k = 0; k < sizeof(pre) - 1 && bi < sizeof banner - 1; k++)
+            banner[bi++] = pre[k];
+        for (const char *n = w->br_site_name;
+             *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
+    } else if (w->br_web_state == BR_WEB_OK) {
+        static const char pre[] = "Fetched http://";
+        for (size_t k = 0; k < sizeof(pre) - 1 && bi < sizeof banner - 1; k++)
+            banner[bi++] = pre[k];
+        for (const char *n = w->br_site_name;
+             *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
+        static const char mid[] = " - ";
+        for (size_t k = 0; k < sizeof(mid) - 1 && bi < sizeof banner - 1; k++)
+            banner[bi++] = mid[k];
+        banner[bi++] = (char)('0' + (w->br_web_len / 1000) % 10);
+        banner[bi++] = (char)('0' + (w->br_web_len / 100) % 10);
+        banner[bi++] = (char)('0' + (w->br_web_len / 10) % 10);
+        banner[bi++] = (char)('0' + w->br_web_len % 10);
+        static const char suf[] = " bytes";
+        for (size_t k = 0; k < sizeof(suf) - 1 && bi < sizeof banner - 1; k++)
+            banner[bi++] = suf[k];
+    } else {
+        static const char fail[] = "Page could not be loaded";
+        for (size_t k = 0; k < sizeof(fail) - 1 && bi < sizeof banner - 1; k++)
+            banner[bi++] = fail[k];
+    }
+    banner[bi] = 0;
+    bb_draw_string(cx + 16, py + 10, banner, 0x00808080u);
+    bb_fill_rect(cx + 16, py + 10 + FONT_H + 6, cw - 32, 1, 0x00E8EBF0u);
+
+    if (w->br_web_state == BR_WEB_BUSY) {
+        bb_draw_string(cx + 16, py + 42,
+                       "Fetching over the SLIRP gateway...", 0x00404040u);
+        return;
+    }
+    if (w->br_web_state == BR_WEB_ERR) {
+        bb_draw_string(cx + 16, py + 42, w->br_web, 0x00C0392Bu);
+        return;
+    }
+
+    /* strip tags + entities into bounded plain text */
+    size_t o = 0;
+    int in_tag = 0, in_ent = 0, prev_space = 1;
+    for (size_t i = 0; i < (size_t)w->br_web_len && o + 1 < sizeof text; i++) {
+        char c = w->br_web[i];
+        if (c == '<') { in_tag = 1; continue; }
+        if (in_tag) { if (c == '>') in_tag = 0; continue; }
+        if (c == '&') { in_ent = 1; continue; }
+        if (in_ent) { if (c == ';') in_ent = 0; continue; }
+        if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+        if (c == ' ') {
+            if (!prev_space) text[o++] = ' ';
+            prev_space = 1;
+            continue;
+        }
+        text[o++] = c;
+        prev_space = 0;
+    }
+    text[o] = 0;
+    br_wrap_text(cx + 16, py + 42, cw - 32, text, 0x00333333u);
+}
+
+/* Renders the BR_PAGE_SITE content: a YouTube mock, a Google mock, or
+ * a generic preview page for any other domain. */
+static void browser_site(int64_t cx, int64_t py, int64_t cw, int64_t ph,
+                         const struct desktop_window *w) {
+    bb_fill_rect(cx, py, cw, ph, 0x00FFFFFFu);
+    if (cw < 320 || ph < 200) return;
+
+    if (w->br_web_state != BR_WEB_IDLE) {
+        browser_web(cx, py, cw, ph, w);
+        return;
+    }
+
+    if (w->br_site_kind == BR_SITE_YOUTUBE) {
+        /* red masthead + decorative search pill */
+        int64_t hdr = 40;
+        bb_fill_rect(cx, py, cw, hdr, 0x00FF0000u);
+        bb_draw_string_scaled(cx + 18, py + (hdr - 2 * FONT_H) / 2,
+                              "YouTube", 0x00FFFFFFu, 2);
+        int64_t pill_w = 200, pill_h = 22;
+        int64_t pill_x = cx + cw - 18 - pill_w;
+        bb_fill_rect(pill_x, py + (hdr - pill_h) / 2, pill_w, pill_h, 0x00E5E5E5u);
+        bb_draw_string(pill_x + 8, py + (hdr - FONT_H) / 2, "Search", 0x00606060u);
+
+        int64_t y = py + hdr + 14;
+        bb_draw_string(cx + 18, y, "Recommended", 0x000F0F0Fu);
+        y += FONT_H + 10;
+
+        static const char *const titles[] = {
+            "Sol OS in 60 seconds",
+            "How the window manager works",
+            "The IST clock deep dive",
+            "Virtio-net, no wires",
+            "Framebuffer pixel art",
+            "Booting a 64-bit kernel",
+        };
+        static const char *const subs[] = {
+            "Sol OS  |  1.2M views",
+            "Sol OS  |  980K views",
+            "Sol OS  |  740K views",
+            "Sol OS  |  1.1M views",
+            "Sol OS  |  610K views",
+            "Sol OS  |  2.3M views",
+        };
+        static const uint32_t cols[] = {
+            0x00FF5A5Fu, 0x004B8BBEu, 0x007B4B9Au,
+            0x00E88C1Fu, 0x004CAF50u, 0x00E25B5Bu,
+        };
+        int64_t pad = 18, gap = 12;
+        int64_t card_w = (cw - pad * 2 - gap * 2) / 3;
+        int64_t thumb_h = card_w * 9 / 16;
+        if (thumb_h > 108) thumb_h = 108;
+        for (int r = 0; r < 2; r++) {
+            for (int k = 0; k < 3; k++) {
+                int idx = r * 3 + k;
+                if (idx >= (int)(sizeof(titles) / sizeof(titles[0]))) break;
+                int64_t tx = cx + pad + (int64_t)k * (card_w + gap);
+                int64_t ty = y + (int64_t)r * (thumb_h + FONT_H * 3 + 8);
+                if (ty + thumb_h + FONT_H * 3 + 6 > py + ph) break;
+                bb_fill_rect(tx, ty, card_w, thumb_h, cols[idx]);
+                bb_draw_char(tx + card_w / 2 - FONT_W / 2,
+                             ty + (thumb_h - FONT_H) / 2, '>', 0x00FFFFFFu);
+                bb_draw_string(tx, ty + thumb_h + 6, titles[idx], 0x000F0F0Fu);
+                bb_draw_string(tx, ty + thumb_h + 6 + FONT_H + 2,
+                               subs[idx], 0x00606060u);
+            }
+        }
+        return;
+    }
+
+    if (w->br_site_kind == BR_SITE_GOOGLE) {
+        /* colored per-letter wordmark */
+        const char *word = "Google";
+        static const uint32_t gcols[6] = {
+            0x004285F4u, 0x00EA4335u, 0x00FBBC05u,
+            0x004285F4u, 0x0034A853u, 0x00EA4335u,
+        };
+        int scale = 3;
+        int64_t wm_w = (int64_t)strlen(word) * FONT_W * scale;
+        int64_t wmy = py + 30;
+        for (int i = 0; word[i]; i++) {
+            char one[2] = { word[i], 0 };
+            bb_draw_string_scaled(cx + (cw - wm_w) / 2 + (int64_t)i * FONT_W * scale,
+                                  wmy, one, gcols[i], scale);
+        }
+        /* search bar */
+        int64_t sbw = 520;
+        if (sbw > cw - 60) sbw = cw - 60;
+        int64_t sby = wmy + FONT_H * scale + 26;
+        bb_fill_rect(cx + (cw - sbw) / 2, sby, sbw, 40, 0x00FFFFFFu);
+        bb_draw_rect(cx + (cw - sbw) / 2, sby, sbw, 40, 0x00DADCE0u);
+        bb_draw_string(cx + (cw - sbw) / 2 + 16, sby + (40 - FONT_H) / 2,
+                       "Search Google or type a URL", 0x008090A0u);
+        /* buttons */
+        int64_t b1w = 104, b2w = 140, by0 = sby + 40 + 16;
+        int64_t sum = b1w + 12 + b2w;
+        int64_t bx0 = cx + (cw - sum) / 2;
+        bb_fill_rect(bx0, by0, b1w, 32, 0x00F8F9FAu);
+        bb_draw_rect(bx0, by0, b1w, 32, 0x00DADCE0u);
+        bb_draw_string(bx0 + (b1w - 13 * FONT_W) / 2, by0 + (32 - FONT_H) / 2,
+                       "Google Search", 0x003C4043u);
+        bb_fill_rect(bx0 + b1w + 12, by0, b2w, 32, 0x00F8F9FAu);
+        bb_draw_rect(bx0 + b1w + 12, by0, b2w, 32, 0x00DADCE0u);
+        bb_draw_string(bx0 + b1w + 12 + (b2w - 17 * FONT_W) / 2,
+                       by0 + (32 - FONT_H) / 2, "I'm Feeling Lucky", 0x003C4043u);
+        return;
+    }
+
+    /* generic preview page */
+    int64_t wm_w = (int64_t)strlen(w->br_site_name) * FONT_W * 2;
+    int scale = 2;
+    if (wm_w > cw - 40) { scale = 1; wm_w /= 2; }
+    bb_fill_rect(cx, py, cw, 44, 0x002766A8u);
+    bb_draw_string_scaled(cx + (cw - wm_w) / 2, py + (44 - FONT_H * 2) / 2,
+                          w->br_site_name, 0x00FFFFFFu, scale);
+    bb_draw_string(cx + 16, py + 44 + 12, "Home   About   Contact", 0x001B2A4Au);
+    static const char *const para[] = {
+        "This is a static preview of the page you asked for.",
+        "sol-os runs its own virtual network with no real",
+        "internet access, so live content cannot load here.",
+        "The address bar and tab already work; try a search",
+        "query to see the mock results page instead.",
+    };
+    int64_t pyy = py + 44 + 12 + FONT_H + 20;
+    for (size_t i = 0; i < sizeof(para) / sizeof(para[0]); i++) {
+        bb_draw_string(cx + 16, pyy, para[i], 0x00404448u);
+        pyy += FONT_H + 4;
+    }
+    bb_fill_rect(cx + cw - 150, py + 44 + 12, 134, 20, 0x00F4F6F9u);
+    bb_draw_rect(cx + cw - 150, py + 44 + 12, 134, 20, 0x00DDE2EAu);
+    bb_draw_string(cx + cw - 144, py + 44 + 12 + 6, "sol.os preview", 0x008090A0u);
+}
+
+/* Renders the BR_PAGE_SEARCH content: a mock results list for the query
+ * stored in w->br_site_name. */
+static void browser_search(int64_t cx, int64_t py, int64_t cw, int64_t ph,
+                           const struct desktop_window *w) {
+    bb_fill_rect(cx, py, cw, ph, 0x00FFFFFFu);
+    if (cw < 320 || ph < 160) return;
+
+    char head[TERM_LINE_MAX + 16];
+    size_t hi = 0;
+    const char *pre = "Results for \"";
+    while (*pre && hi < sizeof(head) - 1) head[hi++] = *pre++;
+    size_t ql = strlen(w->br_site_name);
+    for (size_t i = 0; i < ql && hi < sizeof(head) - 1; i++) head[hi++] = w->br_site_name[i];
+    head[hi++] = '"';
+    head[hi] = 0;
+    bb_draw_string(cx + 20, py + 14, head, 0x001B2A4Au);
+
+    int64_t y = py + 14 + FONT_H + 10;
+    bb_fill_rect(cx + 20, y, cw - 40, 1, 0x00E8EBF0u);
+    y += 10;
+
+    static const char *const rtitles[] = {
+        "Sol OS - the 64-bit microkernel you can build",
+        "Sol OS browser - IST clock preview",
+        "Virtio-net driver - source on GitHub",
+        "The framebuffer compositor, explained",
+    };
+    static const char *const rurls[] = {
+        "sol-os.dev/docs",
+        "sol-os.dev/browser",
+        "github.com/sol-os/virtio-net",
+        "wiki.sol-os.org/compositor",
+    };
+    static const char *const rsnp[] = {
+        "Boots a graphical desktop in about 8 seconds, with a window",
+        "manager, terminal emulator and this very browser.",
+        "A live Indian Standard Time clock, built on the RTC driver.",
+        "A real virtio-net driver for ICMP echo and ARP replies.",
+        "Per-window damage tracking with page flipping and vblank gating.",
+    };
+    for (size_t i = 0; i < sizeof(rtitles) / sizeof(rtitles[0]); i++) {
+        if (y + FONT_H * 3 > py + ph) break;
+        bb_draw_string(cx + 20, y, rtitles[i], 0x00AB0D1Au);
+        y += FONT_H + 2;
+        bb_draw_string(cx + 20, y, rurls[i], 0x00216600u);
+        y += FONT_H + 2;
+        y = br_wrap_text(cx + 20, y, cw - 40, rsnp[i], 0x0056514Du);
+        y += 14;
+        if (i + 1 < sizeof(rtitles) / sizeof(rtitles[0])) {
+            bb_fill_rect(cx + 20, y, cw - 40, 1, 0x00E8EBF0u);
+        }
+        y += 10;
+    }
+    if (y + FONT_H < py + ph) {
+        bb_draw_string(cx + 20, py + ph - FONT_H - 8,
+                       "sol.os search - mock index, no real network", 0x00808080u);
+    }
+}
+
 /* ---- windows (drawing) ---- */
 
 static void win_render(struct desktop_window *w) {
@@ -1378,7 +1881,7 @@ static void win_render(struct desktop_window *w) {
         bb_fill_rect(ntb_x + 9, tab_y + tab_h / 2 - 1, 8, 2, 0x008090A0u);
         bb_fill_rect(ntb_x + 12, tab_y + 4, 2, 16, 0x008090A0u);
         bb_draw_string(cx + sb + 7, tab_y + (tab_h - FONT_H) / 2,
-                       w->title, BODY_TEXT);
+                       w->br_title[0] ? w->br_title : w->title, BODY_TEXT);
         int64_t nav_y = cy + tb_h;
         int64_t page_y = nav_y + nb_h;
         bb_fill_rect(cx, nav_y, cw, nb_h, 0x00F4F6F9u);
@@ -1387,14 +1890,45 @@ static void win_render(struct desktop_window *w) {
         bb_fill_rect(cx + sb + 26, nav_y + 5, 24, 24, 0x00FFFFFFu);
         bb_draw_char(cx + sb + 8, nav_y + (24 - FONT_H) / 2 + 5, '<', 0x00A0A8B4u);
         bb_draw_char(cx + sb + 34, nav_y + (24 - FONT_H) / 2 + 5, '>', 0x00A0A8B4u);
-        /* address bar showing the homepage URL */
+        /* address bar showing the editable URL */
         int64_t ab_x = cx + sb + 56;
         int64_t ab_w = cw - sb * 2 - 56;
         bb_fill_rect(ab_x, nav_y + 5, ab_w, 24, 0x00FFFFFFu);
-        bb_draw_string(ab_x + 8, nav_y + (24 - FONT_H) / 2 + 5,
-                       "sol.os/home", 0x008090A0u);
-        /* homepage (with live IST clock) */
-        browser_home(cx, page_y, cw, cy + ch - page_y);
+        int64_t ab_tx = ab_x + 8;
+        int64_t ab_ty = nav_y + (24 - FONT_H) / 2 + 5;
+        int64_t nfit = (ab_w - 16) / FONT_W;
+        if (nfit < 1) nfit = 1;
+        int start = 0;
+        if (w->br_input_len > nfit) {
+            start = w->br_input_len - nfit;
+            if (w->br_cursor_col >= start + nfit) start = w->br_cursor_col - nfit + 1;
+            if (w->br_cursor_col < start) start = w->br_cursor_col;
+            if (start < 0) start = 0;
+        }
+        int64_t x = ab_tx;
+        if (w->br_input_len == 0) {
+            bb_draw_string(ab_tx, ab_ty, "Search or type a URL...", 0x008090A0u);
+        } else {
+            for (int k = start; k < w->br_input_len && (k - start) < nfit; k++) {
+                bb_draw_char(x, ab_ty, w->br_input[k], 0x001B2A4Au);
+                x += FONT_W;
+            }
+        }
+        if (active && (g_last_second & 1u)) {
+            int64_t caret = ab_tx + (int64_t)(w->br_cursor_col - start) * FONT_W;
+            if (caret < ab_tx + ab_w - 16) {
+                bb_fill_rect(caret, ab_ty + 1, 1, FONT_H, 0x001B2A4Au);
+            }
+        }
+        /* page content: home, a site mock, or search results */
+        int64_t pph = cy + ch - page_y;
+        if (w->br_page == BR_PAGE_SITE) {
+            browser_site(cx, page_y, cw, pph, w);
+        } else if (w->br_page == BR_PAGE_SEARCH) {
+            browser_search(cx, page_y, cw, pph, w);
+        } else {
+            browser_home(cx, page_y, cw, pph);
+        }
 
         /* resize grip in the bottom-right corner */
         if (!w->maximized) {
@@ -1464,6 +1998,16 @@ static int win_open(const char *title, int64_t x, int64_t y,
             n->term_cursor_col = 0;
             term_append_line(n, "Sol OS terminal 0.1");
             term_append_line(n, "Type 'help' for commands.");
+        } else if (kind == 2) {
+            n->br_input_len = (int)strlen("sol.os/home");
+            memcpy(n->br_input, "sol.os/home", (size_t)n->br_input_len + 1);
+            n->br_cursor_col = n->br_input_len;
+            n->br_page = BR_PAGE_HOME;
+            n->br_site_kind = BR_SITE_GENERIC;
+            n->br_web_len = 0;
+            n->br_web_state = BR_WEB_IDLE;
+            br_copy(n->br_site_name, sizeof n->br_site_name, "sol.os/home");
+            br_copy(n->br_title, sizeof n->br_title, "sol.os/home");
         } else {
             n->nlines = nlines > (int)MAX_WIN_LINES ? (int)MAX_WIN_LINES : nlines;
             for (int li = 0; li < n->nlines; li++) n->lines[li] = lines[li];
@@ -1492,6 +2036,7 @@ static void win_close(int idx) {
     if (!w->used) return;
     int64_t x = w->x, y = w->y, bw = w->w, bh = w->h;
     w->used = 0;
+    ns_abort(w);
     if (g_drag == idx) g_drag = -1;
     if (g_resize == idx) g_resize = -1;
     redraw_rect(x, y, bw, bh);
@@ -1841,6 +2386,7 @@ static void present(void) {
 
 void desktop_poll(void) {
     virtio_input_poll();
+    ns_poll();
 
     int32_t dx, dy;
     uint8_t btns;
@@ -1929,14 +2475,20 @@ void desktop_poll(void) {
         g_resize = -1;
     }
 
-    /* Keyboard input: forward to the focused terminal window. */
+    /* Keyboard input: forward to the focused terminal or browser. */
     char kch;
     while (virtio_keyboard_read_char(&kch)) {
         int top = win_topmost_index();
         if (top < 0) continue;
         struct desktop_window *w = &g_wins[top];
-        if (!w->used || w->kind != 1) continue;
-        term_feed(w, (unsigned char)kch);
+        if (!w->used) continue;
+        if (w->kind == 1) {
+            term_feed(w, (unsigned char)kch);
+        } else if (w->kind == 2) {
+            br_feed(w, (unsigned char)kch);
+        } else {
+            continue;
+        }
         redraw_rect(w->x, w->y, w->w, w->h);
     }
 

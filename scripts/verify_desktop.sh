@@ -25,6 +25,7 @@ qemu-system-x86_64 -cdrom "$ISO" -m 256M \
   -serial "file:$LOG" \
   -vga none -device VGA,edid=on,xres=1920,yres=1080 \
   -device virtio-keyboard-pci -device virtio-mouse-pci \
+  -device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
   -qmp "unix:$SOCK,server,nowait" \
   -no-reboot -display none &
 QPID=$!

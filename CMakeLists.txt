@@ -73,6 +73,7 @@ add_executable(kernel.elf
     kernel/drivers/virtio/virtio.c
     kernel/drivers/virtio/virtio_input.c
     kernel/drivers/virtio/virtio_net.c
+    kernel/netstack.c
     kernel/drivers/vga/vbe.c
     libc/string.c
 )

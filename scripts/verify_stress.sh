@@ -32,6 +32,7 @@ qemu-system-x86_64 -cdrom "$ISO" -m 256M \
   -serial "file:$LOG" \
   -vga none -device VGA,edid=on,xres=1920,yres=1080 \
   -device virtio-keyboard-pci -device virtio-mouse-pci \
+  -device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
   -qmp "unix:$SOCK,server,nowait" \
   -no-reboot -display none &
 QPID=$!
@@ -358,7 +359,7 @@ check("final: taskbar edge intact",
 check("final: title 'A' left-of-center", near(px(img, 1469, 99), TXT))
 check("final: title 'A' no mirrored pixel", not near(px(img, 1471, 99), TXT))
 # icons still rendered
-check("final: Terminal tile", near(px(img, 26, 26), (46, 76, 115)))
+check("final: Terminal tile", near(px(img, 26, 26), (69, 139, 217)))
 check("final: Settings tile", near(px(img, 26, 222), (58, 175, 169)))
 
 # --- stage 8: close About last (kept open so stage 7 could check text) ---

@@ -279,7 +279,11 @@ int net_link_up(void) {
     return (g_net.status & VIRTIO_NET_S_LINK_UP) != 0;
 }
 
+int net_present(void) { return g_net.present; }
+
 const uint8_t *net_mac(void) { return g_net.mac; }
+
+const uint8_t *net_ip(void) { return g_net.ip; }
 
 uint64_t net_rx_packet_count(void)  { return g_net.rx_packets; }
 uint64_t net_tx_packet_count(void)  { return g_net.tx_packets; }

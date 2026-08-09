@@ -35,8 +35,14 @@ int net_receive(void *buf, size_t cap, size_t *out_len);
 /* 1 if the NIC reports the link up, 0 otherwise. */
 int net_link_up(void);
 
+/* 1 if a NIC was found and brought up by net_init. */
+int net_present(void);
+
 /* The NIC's MAC address (6 bytes, valid once net_init succeeded). */
 const uint8_t *net_mac(void);
+
+/* This host's IPv4 address (4 bytes, currently 10.0.2.15). */
+const uint8_t *net_ip(void);
 
 /* Diagnostics counters. */
 uint64_t net_rx_packet_count(void);
