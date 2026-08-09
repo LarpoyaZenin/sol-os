@@ -231,7 +231,7 @@ check("close: taskbar About btn removed", near(px(img, 187, 1043), TASKBAR_BG))
 # --- stage 7: desktop icons ---
 shot("/tmp/desk_8.ppm")
 img = load("/tmp/desk_8.ppm")
-check("icons: Terminal tile", near(px(img, 26, 26), (46, 76, 115)))      # 0x002E4C73
+check("icons: Terminal tile", near(px(img, 26, 26), (69, 139, 217)))     # 0x00458BD9
 check("icons: Files tile", near(px(img, 26, 124), ORANGE))
 check("icons: Settings tile", near(px(img, 26, 222), (58, 175, 169)))    # 0x003AAFA9
 
