@@ -101,8 +101,6 @@ static uint64_t g_bb_bytes;     /* g_w * g_h * 4 */
  * display can never catch a half-updated frame. */
 static int      g_flip;
 static unsigned g_front;        /* page currently displayed (0/1) */
-static int64_t  g_cur_on_x[2];  /* cursor position drawn on each page */
-static int64_t  g_cur_on_y[2];  /* -1 = no cursor on that page */
 
 /* Backbuffer guard: the allocation is bb_bytes + 64, and the trailing
  * words are stamped with canaries. Any out-of-bounds backbuffer write
@@ -115,6 +113,8 @@ static uint32_t g_bb_canary[BB_CANARIES];
 
 static int64_t g_cursor_x;
 static int64_t g_cursor_y;
+static int64_t g_cursor_bb_x;   /* cursor position stamped into g_bb */
+static int64_t g_cursor_bb_y;   /* -1 = none stamped yet */
 static uint8_t g_buttons;
 static uint8_t g_buttons_prev;
 static uint64_t g_last_second;
@@ -281,8 +281,8 @@ static int  menu_h(void);
  * damaged region (the desktop icons are the prime offender) can stamp
  * itself over a window that happens to cover it in the backbuffer but
  * is not part of this redraw. The backbuffer is then wrong and the
- * damage shows up later, whenever cursor_restore() blits the region:
- * that is the stray-pixel / ghosting-trail / random-line artifact. */
+ * wrong pixel is carried to the screen by the next damage blit: that
+ * is the stray-pixel / ghosting-trail / random-line artifact. */
 static int      g_bb_clip_active;
 static int64_t  g_bb_clip_x0, g_bb_clip_y0, g_bb_clip_x1, g_bb_clip_y1;
 
@@ -451,22 +451,37 @@ static void damage_add(int64_t x, int64_t y, int64_t w, int64_t h) {
     }
 }
 
-/* ---- cursor ---- */
-
-static void cursor_restore(void) {
-    blit_rect(g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H);
+/* True when the given rect intersects this frame's accumulated damage.
+ * present() uses this to tell whether the scene composite wiped the
+ * cursor out of the backbuffer and it needs re-stamping. */
+static int damage_touches(int64_t x, int64_t y, int64_t w, int64_t h) {
+    if (!g_damage_present) return 0;
+    return x < g_damage_x + g_damage_w && x + w > g_damage_x &&
+           y < g_damage_y + g_damage_h && y + h > g_damage_y;
 }
 
-static void cursor_draw(void) {
+/* ---- cursor ---- */
+
+/* Stamps the cursor into the backbuffer at its current position. The
+ * cursor floats above the scene, so it is never scoped to the active
+ * damage clip (the scene clip is saved and cleared around the draw).
+ * It reaches the screen through the ordinary blit of the damage rect
+ * in present(), exactly like any other backbuffer pixel: both the
+ * single- and double-buffered paths render it identically, and the
+ * erased old position is just another damage region. */
+static void cursor_draw_bb(void) {
+    int clip_was_active = g_bb_clip_active;
+    g_bb_clip_active = 0;
     for (unsigned row = 0; row < CURSOR_H; row++) {
         for (unsigned col = 0; col < CURSOR_W; col++) {
             uint8_t v = cursor_bmp[row][col];
             if (v == 0) continue;
-            fb_put_pixel(g_cursor_x + (int64_t)col,
+            bb_put_pixel(g_cursor_x + (int64_t)col,
                          g_cursor_y + (int64_t)row,
                          v == 1 ? CURSOR_OUTLINE : CURSOR_FILL);
         }
     }
+    g_bb_clip_active = clip_was_active;
 }
 
 /* ---- background ---- */
@@ -1518,10 +1533,9 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
      * Everything below works either way; g_flip only changes how the
      * finished frame reaches the screen. */
     g_flip = fb_enable_double_buffer(hhdm);
-    if (g_flip) fb_vsync_probe();
+    fb_vsync_probe();
     g_front = 0;
-    g_cur_on_x[0] = g_cur_on_y[0] = -1;
-    g_cur_on_x[1] = g_cur_on_y[1] = -1;
+    g_cursor_bb_x = g_cursor_bb_y = -1;
     g_damage_present = 0;
     g_damage_prev_present = 0;
 
@@ -1536,9 +1550,17 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
     win_open("About Sol OS", 120, 90, 460, 240, 0, about_lines, 6);
 
     scene_region(0, 0, (int64_t)g_w, (int64_t)g_h);
+
+    g_cursor_x = (int64_t)g_w / 2 - CURSOR_W / 2;
+    g_cursor_y = (int64_t)g_h / 2 - CURSOR_H / 2;
+    g_cursor_bb_x = g_cursor_x;
+    g_cursor_bb_y = g_cursor_y;
+    cursor_draw_bb();
+
     if (g_flip) {
-        /* Both pages start as a consistent copy of the scene so a
-         * later flip never reveals stale pixels. */
+        /* Both pages start as a consistent copy of the scene (cursor
+         * included - it is part of the backbuffer now) so a later
+         * flip never reveals stale pixels. */
         fb_set_active_page(0);
         blit_full();
         fb_set_active_page(1);
@@ -1547,13 +1569,9 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
     } else {
         blit_full();
     }
+    g_damage_present = 0;
+    g_damage_prev_present = 0;
     g_last_second = timer_get_ticks() / 100;
-
-    g_cursor_x = (int64_t)g_w / 2 - CURSOR_W / 2;
-    g_cursor_y = (int64_t)g_h / 2 - CURSOR_H / 2;
-    g_cur_on_x[g_front] = g_cursor_x;
-    g_cur_on_y[g_front] = g_cursor_y;
-    cursor_draw();
 
     klog("[desktop] %lu x %lu desktop up (%s buffered), %u window(s), "
          "heap free %lu KiB\n",
@@ -1564,29 +1582,32 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
 
 /* ---- presenting the finished frame ---- */
 
-/* Single-buffer path: restore the old cursor (the cursor was erased
- * from the live page at the start of the poll), blit this frame's
- * damage, then draw the cursor at its new position. */
+/* Single-buffer path: blit this frame's damage to the live scanout.
+ * Gated to vertical retrace when the hardware drives one, so the
+ * frame lands between scanlines instead of mid-scanout. */
 static void present_single(void) {
-    if (g_damage_present) {
-        blit_rect(g_damage_x, g_damage_y, g_damage_w, g_damage_h);
-        g_damage_present = 0;
+    if (!g_damage_present) return;
+    if (fb_vsync_live()) {
+        uint64_t deadline = timer_get_ticks() + 1u;
+        while (!fb_vblank_active() && timer_get_ticks() < deadline) {
+            __asm__ volatile ("pause");
+        }
     }
-    cursor_draw();
+    blit_rect(g_damage_x, g_damage_y, g_damage_w, g_damage_h);
+    g_damage_present = 0;
 }
 
 /* Page-flip path: bring the back page up to the current scene and
- * present it. The back page last held a scene two frames old (with a
- * cursor stamped on it when it was the front page), so it needs the
- * previous frame's damage too, plus that stale cursor erased. */
+ * present it. The back page last held a scene two frames old (it was
+ * the front page during the previous frame), so it needs the previous
+ * frame's damage as well as this one's. The cursor needs no special
+ * handling here: it lives in the backbuffer and its movement is part
+ * of the damage, exactly like any other scene change. */
 static void present_flip(void) {
     unsigned back = 1u - g_front;
 
     fb_set_active_page(back);
 
-    if (g_cur_on_y[back] >= 0) {
-        blit_rect(g_cur_on_x[back], g_cur_on_y[back], CURSOR_W, CURSOR_H);
-    }
     if (g_damage_prev_present) {
         blit_rect(g_damage_prev_x, g_damage_prev_y,
                   g_damage_prev_w, g_damage_prev_h);
@@ -1613,24 +1634,35 @@ static void present_flip(void) {
     }
     fb_flip_pages();
     g_front = back;
-
-    g_cur_on_x[back] = g_cursor_x;
-    g_cur_on_y[back] = g_cursor_y;
-    cursor_draw();
 }
 
 static void present(void) {
+    /* The backbuffer is the one true scene. Erase the previous frame's
+     * cursor from it (recomposite the scene over the old spot) and
+     * stamp the current one; both land in this frame's damage, so the
+     * cursor moves atomically with the scene on every path.
+     *
+     * Erase only when something about the cursor changed: if it is
+     * stationary and nothing was drawn over it, the backbuffer is
+     * already correct and re-stamping would just force a redundant
+     * blit on every poll. */
+    int moved = (g_cursor_bb_x != g_cursor_x) || (g_cursor_bb_y != g_cursor_y);
+    if (moved) {
+        redraw_rect(g_cursor_bb_x, g_cursor_bb_y, CURSOR_W, CURSOR_H);
+    }
+
+    if (moved || damage_touches(g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H)) {
+        cursor_draw_bb();
+        damage_add(g_cursor_x, g_cursor_y, CURSOR_W, CURSOR_H);
+    }
+    g_cursor_bb_x = g_cursor_x;
+    g_cursor_bb_y = g_cursor_y;
+
     if (g_flip) present_flip();
     else present_single();
 }
 
 void desktop_poll(void) {
-    /* Erase last frame's cursor from the live page. In page-flip mode
-     * the cursor lives on the (currently) front page which will only
-     * be written again when it cycles back to the back page, so this
-     * erase is handled there instead. */
-    if (!g_flip) cursor_restore();
-
     virtio_input_poll();
 
     int32_t dx, dy;
