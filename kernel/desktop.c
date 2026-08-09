@@ -170,10 +170,12 @@ struct desktop_icon {
     const char *label;
     char glyph;
     uint32_t color;
-    int kind;                      /* 0 = info window, 1 = terminal */
+    int kind;                      /* 0 = info window, 1 = terminal, 2 = browser */
     const char *win_title;
     const char *const *win_lines;
     int nlines;
+    int64_t win_w;
+    int64_t win_h;
 };
 
 static const char *const ic_terminal_lines[] = {
@@ -211,11 +213,20 @@ static const char *const ic_about_lines[] = {
     "Welcome to Sol OS.",
 };
 
+/* The browser window is opened larger than the other apps so its
+ * chrome (tab strip + nav bar) leaves room for real page content. */
+#define BROWSER_ICON_W 720
+#define BROWSER_ICON_H 460
+
 static const struct desktop_icon g_icons[] = {
-    { "Terminal", '>', 0x002E4C73, 1, "Terminal",    ic_terminal_lines, 4 },
-    { "Files",    'F', 0x00F5A623, 0, "Files",       ic_files_lines,   8 },
-    { "Settings", 'S', 0x003AAFA9, 0, "Settings",    ic_settings_lines, 8 },
-    { "About",    'A', 0x006B5B95, 0, "About Sol OS", ic_about_lines,  6 },
+    /* The Terminal tile used to be nearly the same colour as the dark
+     * background gradient, so the top-left of the desktop read as a
+     * blank "gap". It is now a vivid blue that clearly stands out. */
+    { "Terminal", '>', 0x00458BD9u, 1, "Terminal",    ic_terminal_lines, 4, 460, 220 },
+    { "Files",    'F', 0x00F5A623u, 0, "Files",       ic_files_lines,   8, 460, 220 },
+    { "Settings", 'S', 0x003AAFA9u, 0, "Settings",    ic_settings_lines, 8, 460, 220 },
+    { "About",    'A', 0x006B5B95u, 0, "About Sol OS", ic_about_lines,  6, 460, 220 },
+    { "Browser",  'B', 0x00E5484Du, 2, "Browser",     NULL,              0, BROWSER_ICON_W, BROWSER_ICON_H },
 };
 #define ICON_COUNT (unsigned)(sizeof(g_icons) / sizeof(g_icons[0]))
 
@@ -624,7 +635,7 @@ static void icon_open(int idx) {
     int64_t x = 300 + (int64_t)(g_icon_opens % 4) * 36;
     int64_t y = 90 + (int64_t)(g_icon_opens % 4) * 28;
     g_icon_opens++;
-    int wi = win_open(ic->win_title, x, y, 460, 220, ic->kind,
+    int wi = win_open(ic->win_title, x, y, ic->win_w, ic->win_h, ic->kind,
                       ic->win_lines, ic->nlines);
     if (wi >= 0) {
         redraw_rect(g_wins[wi].x, g_wins[wi].y, g_wins[wi].w, g_wins[wi].h);
@@ -1227,6 +1238,31 @@ static void win_render(struct desktop_window *w) {
 
     if (w->kind == 1) {
         term_render(w, active);
+        return;
+    }
+
+    if (w->kind == 2) {
+        /* Browser chrome: a tab strip and a nav bar, leaving the rest
+         * of the window as a blank page. The window is opened larger
+         * than other apps so the chrome leaves room for real content. */
+        int64_t cx = x + 1, cy = y + 1 + TITLE_H;
+        int64_t cw = bw - 2, ch = bh - 2 - TITLE_H;
+        bb_fill_rect(cx, cy, cw, ch, 0x00E8EBF0u);
+        int64_t tb_h = 30, nb_h = 34;
+        int64_t sb = 20;   /* side padding for tab + address bar */
+        int64_t tab_y = cy + 6;
+        int64_t tab_w = 180, tab_h = 24;
+        bb_fill_rect(cx + sb, tab_y, tab_w, tab_h, 0x00FFFFFFu);
+        bb_fill_rect(cx + sb + tab_w + 6, tab_y, 26, tab_h, 0x00DDE2EAu);
+        bb_draw_string(cx + sb + 7, tab_y + (tab_h - FONT_H) / 2,
+                       w->title, BODY_TEXT);
+        int64_t nav_y = cy + tb_h;
+        int64_t page_y = nav_y + nb_h;
+        bb_fill_rect(cx, nav_y, cw, nb_h, 0x00F4F6F9u);
+        bb_fill_rect(cx + sb, nav_y + 5, cw - sb * 2, 24, 0x00FFFFFFu);
+        bb_fill_rect(cx + sb, nav_y + 5, 24, 24, 0x00F4F6F9u);
+        bb_draw_char(cx + sb + 8, nav_y + (24 - FONT_H) / 2 + 5, '>', BODY_TEXT);
+        bb_fill_rect(cx, page_y, cw, cy + ch - page_y, 0x00FFFFFFu);
         return;
     }
 
