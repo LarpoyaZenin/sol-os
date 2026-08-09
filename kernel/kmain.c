@@ -13,6 +13,7 @@
 #include "arch/x86_64/mouse.h"
 #include "drivers/pci/pci.h"
 #include "drivers/virtio/virtio_input.h"
+#include "net.h"
 #include "string.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -126,6 +127,15 @@ void kmain(void) {
     virtio_input_init(hhdm_offset);
     klog("VirtIO input initialized.\n");
 
+    if (net_init(hhdm_offset)) {
+        klog("Network up: link=%d mac=%x:%x:%x:%x:%x:%x\n",
+             net_link_up(),
+             net_mac()[0], net_mac()[1], net_mac()[2],
+             net_mac()[3], net_mac()[4], net_mac()[5]);
+    } else {
+        klog("Network: no NIC.\n");
+    }
+
     desktop_init(fb, hhdm_offset);
 
     /* Main loop: echo typed characters to serial, let the desktop
@@ -142,6 +152,7 @@ void kmain(void) {
         }
 
         desktop_poll();
+        net_poll();
 
         int32_t dx, dy;
         uint8_t btns;
@@ -157,7 +168,8 @@ void kmain(void) {
             klog("\n[heartbeat] ticks=%u mouse_irqs=%lu mouse_packets=%lu "
                  "(+%lu) virtio_irqs=%lu virtio_events=%lu (+%lu) "
                  "virtio_key=%lu virtio_rel=%lu virtio_dropped=%lu "
-                 "heap_free=%lu\n",
+                 "heap_free=%lu net_irqs=%lu net_rx=%lu net_tx=%lu "
+                 "net_rxdrops=%lu net_txdrops=%lu\n",
                  (unsigned)t, (unsigned long)mouse_irq_count(),
                  (unsigned long)mouse_pkts,
                  (unsigned long)(mouse_pkts - last_mouse_pkts),
@@ -167,7 +179,12 @@ void kmain(void) {
                  (unsigned long)virtio_input_key_count(),
                  (unsigned long)virtio_input_rel_count(),
                  (unsigned long)virtio_input_dropped_count(),
-                 (unsigned long)kheap_free_bytes());
+                 (unsigned long)kheap_free_bytes(),
+                 (unsigned long)net_irq_count(),
+                 (unsigned long)net_rx_packet_count(),
+                 (unsigned long)net_tx_packet_count(),
+                 (unsigned long)net_rx_dropped_count(),
+                 (unsigned long)net_tx_dropped_count());
             last_heartbeat = t;
             last_mouse_pkts = mouse_pkts;
             last_virtio_events = virtio_events;

@@ -72,6 +72,7 @@ add_executable(kernel.elf
     kernel/drivers/pci/pci.c
     kernel/drivers/virtio/virtio.c
     kernel/drivers/virtio/virtio_input.c
+    kernel/drivers/virtio/virtio_net.c
     kernel/drivers/vga/vbe.c
     libc/string.c
 )
@@ -110,6 +111,7 @@ add_custom_target(run
         -serial stdio
         -vga none
         -device VGA,edid=on,xres=1920,yres=1080
+        -nic user,model=virtio-net-pci
         -no-reboot
         -no-shutdown
     DEPENDS iso
