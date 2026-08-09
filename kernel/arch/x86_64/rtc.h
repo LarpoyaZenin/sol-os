@@ -17,4 +17,8 @@ struct rtc_datetime {
  * and 12-hour format. Returns false only if no RTC is present. */
 bool rtc_read(struct rtc_datetime *dt);
 
+/* Same as rtc_read() but with the clock converted to Indian Standard
+ * Time (UTC + 5:30), including day/month/year rollover. */
+bool rtc_read_ist(struct rtc_datetime *dt);
+
 #endif /* SOL_RTC_H */

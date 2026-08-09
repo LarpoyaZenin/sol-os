@@ -525,7 +525,7 @@ static const char *g_months[12] = {
 
 static void build_clock_str(char *buf) {
     struct rtc_datetime dt;
-    if (!rtc_read(&dt)) {
+    if (!rtc_read_ist(&dt)) {
         strcpy(buf, "--:--:--");
         return;
     }
@@ -970,7 +970,7 @@ static void term_print(struct desktop_window *w, const char *s) {
 static void term_print_time(struct desktop_window *w) {
     struct rtc_datetime dt;
     char buf[24];
-    if (!rtc_read(&dt)) {
+    if (!rtc_read_ist(&dt)) {
         term_print(w, "Time: --:--:--");
         return;
     }
@@ -980,6 +980,8 @@ static void term_print_time(struct desktop_window *w) {
     put_digits(buf, &i, dt.hour, 2);   buf[i++] = ':';
     put_digits(buf, &i, dt.minute, 2); buf[i++] = ':';
     put_digits(buf, &i, dt.second, 2);
+    const char *ist = " IST";
+    while (*ist) buf[i++] = *ist++;
     buf[i] = 0;
     term_print(w, buf);
 }
@@ -987,7 +989,7 @@ static void term_print_time(struct desktop_window *w) {
 static void term_print_date(struct desktop_window *w) {
     struct rtc_datetime dt;
     char buf[32];
-    if (!rtc_read(&dt)) {
+    if (!rtc_read_ist(&dt)) {
         term_print(w, "Date: --/--/----");
         return;
     }
@@ -1201,6 +1203,123 @@ static void term_render(struct desktop_window *w, int active) {
     }
 }
 
+/* ---- browser homepage ---- */
+
+static const char *g_days_full[7] = {
+    "Sunday", "Monday", "Tuesday", "Wednesday",
+    "Thursday", "Friday", "Saturday",
+};
+
+/* Day of week for a date, 0 = Sunday (Sakamoto's algorithm). */
+static int day_of_week(int y, int m, int d) {
+    static const int t[12] = { 0,3,2,5,0,3,5,1,4,6,2,4 };
+    if (m < 3) y--;
+    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+/* Draws a string with each glyph scaled up by `scale` (2 = double
+ * size), used for the browser wordmark and the IST clock. */
+static void bb_draw_string_scaled(int64_t x, int64_t y, const char *s,
+                                  uint32_t fg, int scale) {
+    if (scale < 1) scale = 1;
+    while (*s) {
+        const uint8_t *glyph = font8x8_basic[(unsigned char)*s];
+        for (int r = 0; r < FONT_H; r++) {
+            uint8_t bits = glyph[r];
+            if (bits == 0) continue;
+            for (int c = 0; c < FONT_W; c++) {
+                if ((bits >> c) & 1u) {
+                    bb_fill_rect(x + (int64_t)c * scale, y + (int64_t)r * scale,
+                                 scale, scale, fg);
+                }
+            }
+        }
+        x += (int64_t)FONT_W * scale;
+        s++;
+    }
+}
+
+static void build_ist_datetime(struct rtc_datetime *dt, int *dow) {
+    if (rtc_read_ist(dt)) {
+        *dow = day_of_week(dt->year, dt->month, dt->day);
+    } else {
+        dt->year = 0; dt->month = 0; dt->day = 0;
+        dt->hour = 0; dt->minute = 0; dt->second = 0;
+        *dow = 0;
+    }
+}
+
+/* Renders the browser window's page region as a Sol OS homepage with
+ * a live Indian Standard Time clock. All geometry is clipped by the
+ * backbuffer primitives, so tiny/resized windows degrade gracefully
+ * (chrome-only for windows too small to host the layout). */
+static void browser_home(int64_t cx, int64_t py, int64_t cw, int64_t ph) {
+    bb_fill_rect(cx, py, cw, ph, 0x00FFFFFFu);
+    if (cw < 320 || ph < 220) return;   /* chrome-only for tiny windows */
+
+    struct rtc_datetime dt;
+    int dow;
+    build_ist_datetime(&dt, &dow);
+
+    /* Wordmark. */
+    int64_t wm_w = (int64_t)strlen("SOL OS") * FONT_W * 2;
+    bb_draw_string_scaled(cx + (cw - wm_w) / 2, py + 34, "SOL OS", 0x002766A8u, 2);
+
+    /* Subtitle. */
+    int64_t st_w = (int64_t)strlen("Welcome to the Sol OS browser.") * FONT_W;
+    bb_draw_string(cx + (cw - st_w) / 2, py + 34 + 2 * FONT_H + 12,
+                   "Welcome to the Sol OS browser.", 0x00607080u);
+
+    /* Search-bar mock. */
+    int64_t sw = cw < 560 ? cw - 80 : 480;
+    if (sw < 120) sw = 120;
+    int64_t sb_x = cx + (cw - sw) / 2;
+    int64_t sb_y = py + 34 + 2 * FONT_H + 12 + FONT_H + 26;
+    bb_fill_rect(sb_x, sb_y, sw, 26, 0x00F4F6F9u);
+    bb_draw_rect(sb_x, sb_y, sw, 26, 0x00DDE2EAu);
+    bb_draw_string(sb_x + 10, sb_y + (26 - FONT_H) / 2,
+                   "Search or type a URL...", 0x008090A0u);
+
+    /* Indian Standard Time panel. */
+    int64_t pw = 400, phh = 132;
+    if (pw > cw - 60) pw = cw - 60;
+    int64_t px0 = cx + (cw - pw) / 2;
+    int64_t py0 = sb_y + 26 + 30;
+    bb_fill_rect(px0, py0, pw, phh, 0x00F4F6F9u);
+    bb_draw_rect(px0, py0, pw, phh, 0x00DDE2EAu);
+
+    int64_t lab_w = (int64_t)strlen("Indian Standard Time (IST)") * FONT_W;
+    bb_draw_string(px0 + (pw - lab_w) / 2, py0 + 10,
+                   "Indian Standard Time (IST)", 0x002766A8u);
+
+    char tbuf[24];
+    size_t i = 0;
+    put_digits(tbuf, &i, dt.hour, 2);   tbuf[i++] = ':';
+    put_digits(tbuf, &i, dt.minute, 2); tbuf[i++] = ':';
+    put_digits(tbuf, &i, dt.second, 2);
+    tbuf[i] = 0;
+    int64_t tlen = (int64_t)strlen(tbuf);
+    bb_draw_string_scaled(px0 + (pw - tlen * FONT_W * 2) / 2,
+                          py0 + 10 + FONT_H + 10, tbuf, 0x001B2A4Au, 2);
+
+    char dbuf[32];
+    i = 0;
+    const char *dn = (dow >= 0 && dow <= 6) ? g_days_full[dow] : "???";
+    while (*dn && i < sizeof(dbuf) - 1) dbuf[i++] = *dn++;
+    dbuf[i++] = ',';
+    dbuf[i++] = ' ';
+    put_digits(dbuf, &i, dt.day, 2);
+    dbuf[i++] = ' ';
+    const char *mn = (dt.month >= 1 && dt.month <= 12) ? g_months[dt.month - 1] : "???";
+    while (*mn && i < sizeof(dbuf) - 1) dbuf[i++] = *mn++;
+    dbuf[i++] = ' ';
+    put_digits(dbuf, &i, dt.year, 4);
+    dbuf[i] = 0;
+    int64_t dlen = (int64_t)strlen(dbuf);
+    bb_draw_string(px0 + (pw - dlen * FONT_W) / 2,
+                   py0 + 10 + FONT_H + 10 + 2 * FONT_H + 14, dbuf, 0x00607080u);
+}
+
 /* ---- windows (drawing) ---- */
 
 static void win_render(struct desktop_window *w) {
@@ -1243,7 +1362,7 @@ static void win_render(struct desktop_window *w) {
 
     if (w->kind == 2) {
         /* Browser chrome: a tab strip and a nav bar, leaving the rest
-         * of the window as a blank page. The window is opened larger
+         * of the window as the homepage. The window is opened larger
          * than other apps so the chrome leaves room for real content. */
         int64_t cx = x + 1, cy = y + 1 + TITLE_H;
         int64_t cw = bw - 2, ch = bh - 2 - TITLE_H;
@@ -1253,16 +1372,38 @@ static void win_render(struct desktop_window *w) {
         int64_t tab_y = cy + 6;
         int64_t tab_w = 180, tab_h = 24;
         bb_fill_rect(cx + sb, tab_y, tab_w, tab_h, 0x00FFFFFFu);
-        bb_fill_rect(cx + sb + tab_w + 6, tab_y, 26, tab_h, 0x00DDE2EAu);
+        /* new-tab button with a '+' glyph */
+        int64_t ntb_x = cx + sb + tab_w + 6;
+        bb_fill_rect(ntb_x, tab_y, 26, tab_h, 0x00DDE2EAu);
+        bb_fill_rect(ntb_x + 9, tab_y + tab_h / 2 - 1, 8, 2, 0x008090A0u);
+        bb_fill_rect(ntb_x + 12, tab_y + 4, 2, 16, 0x008090A0u);
         bb_draw_string(cx + sb + 7, tab_y + (tab_h - FONT_H) / 2,
                        w->title, BODY_TEXT);
         int64_t nav_y = cy + tb_h;
         int64_t page_y = nav_y + nb_h;
         bb_fill_rect(cx, nav_y, cw, nb_h, 0x00F4F6F9u);
-        bb_fill_rect(cx + sb, nav_y + 5, cw - sb * 2, 24, 0x00FFFFFFu);
-        bb_fill_rect(cx + sb, nav_y + 5, 24, 24, 0x00F4F6F9u);
-        bb_draw_char(cx + sb + 8, nav_y + (24 - FONT_H) / 2 + 5, '>', BODY_TEXT);
-        bb_fill_rect(cx, page_y, cw, cy + ch - page_y, 0x00FFFFFFu);
+        /* back / forward buttons */
+        bb_fill_rect(cx + sb, nav_y + 5, 24, 24, 0x00FFFFFFu);
+        bb_fill_rect(cx + sb + 26, nav_y + 5, 24, 24, 0x00FFFFFFu);
+        bb_draw_char(cx + sb + 8, nav_y + (24 - FONT_H) / 2 + 5, '<', 0x00A0A8B4u);
+        bb_draw_char(cx + sb + 34, nav_y + (24 - FONT_H) / 2 + 5, '>', 0x00A0A8B4u);
+        /* address bar showing the homepage URL */
+        int64_t ab_x = cx + sb + 56;
+        int64_t ab_w = cw - sb * 2 - 56;
+        bb_fill_rect(ab_x, nav_y + 5, ab_w, 24, 0x00FFFFFFu);
+        bb_draw_string(ab_x + 8, nav_y + (24 - FONT_H) / 2 + 5,
+                       "sol.os/home", 0x008090A0u);
+        /* homepage (with live IST clock) */
+        browser_home(cx, page_y, cw, cy + ch - page_y);
+
+        /* resize grip in the bottom-right corner */
+        if (!w->maximized) {
+            int64_t gr = x + bw - 12;
+            int64_t gb = y + bh - 12;
+            bb_fill_rect(gr, gb + 8, 10, 2, 0x00C0C8D4u);
+            bb_fill_rect(gr + 4, gb + 4, 10, 2, 0x00C0C8D4u);
+            bb_fill_rect(gr + 8, gb, 10, 2, 0x00C0C8D4u);
+        }
         return;
     }
 
@@ -1803,11 +1944,25 @@ void desktop_poll(void) {
     if (sec != g_last_second) {
         g_last_second = sec;
         render_clock();
+        /* Fullscreen mode changes on the host (QEMU scaling, monitor
+         * switch) can take the VGA vertical-retrace emulation away or
+         * restore it. Re-probe every 10s so the present path keeps
+         * gating its flips/blits on vblank when the hardware drives
+         * one, instead of tearing against the scanout forever. */
+        if ((sec % 10u) == 0u) {
+            fb_vsync_probe();
+        }
         /* blink the cursor of the focused terminal */
         int top = win_topmost_index();
         if (top >= 0 && g_wins[top].used && g_wins[top].kind == 1) {
             redraw_rect(g_wins[top].x, g_wins[top].y,
                         g_wins[top].w, g_wins[top].h);
+        }
+        /* tick the homepage clock of every visible browser window */
+        for (unsigned i = 0; i < MAX_WINDOWS; i++) {
+            if (g_wins[i].used && !g_wins[i].minimized && g_wins[i].kind == 2) {
+                redraw_rect(g_wins[i].x, g_wins[i].y, g_wins[i].w, g_wins[i].h);
+            }
         }
         if (!desktop_gfx_integrity()) {
             klog("[gfx] INTEGRITY FAILURE at %lu s\n", (unsigned long)sec);

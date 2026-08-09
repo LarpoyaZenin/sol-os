@@ -81,3 +81,36 @@ bool rtc_read(struct rtc_datetime *dt) {
     dt->second = s;
     return true;
 }
+
+/* IST is UTC + 5:30. */
+#define IST_OFFSET_MIN 330
+
+static int days_in_month(int month, int year) {
+    static const int dim[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (month < 1 || month > 12) return 31;
+    if (month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
+        return 29;
+    return dim[month - 1];
+}
+
+/* Same as rtc_read() but converts the CMOS clock (UTC) to Indian
+ * Standard Time, rolling the calendar date over midnight. */
+bool rtc_read_ist(struct rtc_datetime *dt) {
+    if (!rtc_read(dt)) return false;
+
+    int total = dt->hour * 60 + dt->minute + IST_OFFSET_MIN;
+    dt->hour = (total / 60) % 24;
+    dt->minute = total % 60;
+    if (total >= 24 * 60) {
+        dt->day++;
+        if (dt->day > days_in_month(dt->month, dt->year)) {
+            dt->day = 1;
+            dt->month++;
+            if (dt->month > 12) {
+                dt->month = 1;
+                dt->year++;
+            }
+        }
+    }
+    return true;
+}
