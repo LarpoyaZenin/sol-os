@@ -1,0 +1,10 @@
+# Sol OS Rust kernel toolchain.
+#
+# `stable` is sufficient: the kernel needs no nightly features. The
+# custom `x86_64-sol.json` target has no precompiled `core`, so we use
+# `-Z build-std=core` (accepted on stable cargo as of this toolchain)
+# which rebuilds core from the `rust-src` component.
+[toolchain]
+channel = "stable"
+components = ["rust-src", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

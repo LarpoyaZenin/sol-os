@@ -1,0 +1,1 @@
+{"rustc":11722972603611519644,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[17140924317323008174,"build_script_build",false,4875558139925839438]],"local":[{"RerunIfChanged":{"output":"release/build/sol-os-rust-9b98f745d8c61fce/output","paths":["linker.ld"]}}],"rustflags":[],"config":0,"compile_kind":0}

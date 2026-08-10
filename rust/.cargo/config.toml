@@ -1,0 +1,16 @@
+# Build target: the builtin `x86_64-unknown-none` triple, which already
+# carries every setting our kernel needs (kernel code model, no red
+# zone, soft-float, no SSE, rust-lld) and ships a precompiled `core`,
+# so we stay on a stable toolchain with no -Z flags.
+#
+# `rust/x86_64-sol.json` pins the identical target spec for reference;
+# it is not used directly because loading custom JSON targets and
+# building std for them (build-std) are nightly-only features.
+[build]
+target = "x86_64-unknown-none"
+
+# Force a static, position-dependent kernel (mirrors the C build's
+# -mcmodel=kernel / no-pie): no GOT/PLT indirection for our higher-half
+# global data.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]
