@@ -96,6 +96,46 @@ pub struct LimineHhdmRequest {
     pub response: *mut LimineHhdmResponse,
 }
 
+#[repr(C)]
+pub struct LimineUuid {
+    pub a: u32,
+    pub b: u16,
+    pub c: u16,
+    pub d: [u8; 8],
+}
+
+#[repr(C)]
+pub struct LimineFile {
+    pub revision: u64,
+    pub address: *mut u8,
+    pub size: u64,
+    pub path: *mut u8,
+    pub cmdline: *mut u8,
+    pub media_type: u32,
+    pub unused: u32,
+    pub tftp_ip: u32,
+    pub tftp_port: u32,
+    pub partition_index: u32,
+    pub mbr_disk_id: u32,
+    pub gpt_disk_uuid: LimineUuid,
+    pub gpt_part_uuid: LimineUuid,
+    pub part_uuid: LimineUuid,
+}
+
+#[repr(C)]
+pub struct LimineModuleResponse {
+    pub revision: u64,
+    pub module_count: u64,
+    pub modules: *mut *mut LimineFile,
+}
+
+#[repr(C)]
+pub struct LimineModuleRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut LimineModuleResponse,
+}
+
 /// Base revision marker (LIMINE_BASE_REVISION(3) in C).
 #[used]
 #[no_mangle]
@@ -153,6 +193,19 @@ static mut HHDM_REQUEST: LimineHhdmRequest = LimineHhdmRequest {
 };
 
 #[used]
+#[link_section = ".limine_requests"]
+static mut MODULE_REQUEST: LimineModuleRequest = LimineModuleRequest {
+    id: [
+        0xc7b1dd30df4c8b88,
+        0x0a82e883a194f07b,
+        0x3e7e279702be32af,
+        0xca1c4f3bd1280cee,
+    ],
+    revision: 0,
+    response: core::ptr::null_mut(),
+};
+
+#[used]
 #[link_section = ".limine_requests_end"]
 static LIMINE_REQUESTS_END_MARKER: [u64; 2] =
     [LIMINE_COMMON_MAGIC[0], LIMINE_COMMON_MAGIC[1]];
@@ -193,4 +246,10 @@ pub unsafe fn memmap() -> Option<(u64, u64)> {
         }
     }
     Some((response.entry_count, usable))
+}
+
+/// Returns the boot modules (Limine `--module` files), if any.
+pub unsafe fn modules() -> Option<&'static LimineModuleResponse> {
+    let response = unsafe { MODULE_REQUEST.response.as_ref() }?;
+    Some(response)
 }

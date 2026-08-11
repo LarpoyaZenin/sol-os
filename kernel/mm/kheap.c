@@ -20,7 +20,10 @@
  * kfree — allocation is then monotonically forward. A slab allocator
  * for fixed-size kernel objects is the planned Stage 3. */
 
-#define KHEAP_SIZE (16u * 1024u * 1024u)   /* 16 MiB initial heap */
+#define KHEAP_SIZE (96u * 1024u * 1024u)   /* 96 MiB initial heap */
+/* The heap backs the full-screen backbuffer (8 MiB), the decoded
+ * wallpaper bitmap (8 MiB), the FAT32 filesystem image and its
+ * scratch buffers, process stacks and kernel objects. */
 
 #define HEAP_MAGIC 0x48454150u           /* "HEAP" */
 #define HEAP_MIN_BLOCK 16u                 /* minimum payload for a split block */

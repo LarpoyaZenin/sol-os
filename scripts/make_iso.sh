@@ -26,6 +26,9 @@ mkdir -p "$ISO_ROOT/boot" "$ISO_ROOT/boot/limine" "$ISO_ROOT/EFI/BOOT"
 cp "${BUILD_DIR}/kernel.elf" "$ISO_ROOT/boot/kernel.elf"
 cp "${SRC_DIR}/boot/limine.conf" "$ISO_ROOT/boot/limine/limine.conf"
 
+# On-disk assets the kernel mounts at boot as Limine modules.
+cp "${SRC_DIR}/assets/wallpaper.png" "$ISO_ROOT/boot/wallpaper.png"
+
 # BIOS boot stage files
 cp "$LIMINE_DIR/limine-bios.sys" "$ISO_ROOT/boot/limine/"
 cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"

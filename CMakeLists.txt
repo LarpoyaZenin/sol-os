@@ -54,6 +54,8 @@ add_executable(kernel.elf
     kernel/framebuffer.c
     kernel/font.c
     kernel/desktop.c
+    kernel/png.c
+    kernel/wallpaper.c
     kernel/limine_requests.c
     kernel/mm/pmm.c
     kernel/mm/kheap.c

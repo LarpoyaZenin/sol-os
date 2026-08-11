@@ -30,5 +30,12 @@ struct limine_hhdm_request hhdm_request = {
     .response = NULL,
 };
 
+__attribute__((used, section(".limine_requests")))
+struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST,
+    .revision = 0,
+    .response = NULL,
+};
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t limine_requests_end_marker[2] = { LIMINE_COMMON_MAGIC };

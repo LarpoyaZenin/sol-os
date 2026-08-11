@@ -7,6 +7,7 @@
 #include "arch/x86_64/rtc.h"
 #include "drivers/virtio/virtio_input.h"
 #include "netstack.h"
+#include "wallpaper.h"
 #include "string.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -679,10 +680,14 @@ static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
     g_bb_clip_x0 = x0; g_bb_clip_y0 = y0;
     g_bb_clip_x1 = x1; g_bb_clip_y1 = y1;
 
-    for (int64_t yy = y0; yy < y1; yy++) {
-        uint32_t c = gradient_color((uint64_t)yy, g_h);
-        uint32_t *row = g_bb + (uint64_t)yy * g_w;
-        for (int64_t xx = x0; xx < x1; xx++) row[xx] = c;
+    if (wallpaper_ready()) {
+        wallpaper_render(g_bb, g_w, x0, y0, x1, y1);
+    } else {
+        for (int64_t yy = y0; yy < y1; yy++) {
+            uint32_t c = gradient_color((uint64_t)yy, g_h);
+            uint32_t *row = g_bb + (uint64_t)yy * g_w;
+            for (int64_t xx = x0; xx < x1; xx++) row[xx] = c;
+        }
     }
 
     icon_draw();
@@ -2248,6 +2253,8 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
         g_bb_canary[i] = BB_CANARY_BASE + i;
         g_bb[g_bb_bytes / 4u + i] = g_bb_canary[i];
     }
+
+    wallpaper_init();
 
     gfx_selftest();
 

@@ -6,5 +6,6 @@
 extern struct limine_framebuffer_request framebuffer_request;
 extern struct limine_memmap_request memmap_request;
 extern struct limine_hhdm_request hhdm_request;
+extern struct limine_module_request module_request;
 
 #endif /* SOL_LIMINE_REQUESTS_H */
