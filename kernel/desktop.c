@@ -60,6 +60,69 @@
 #define TERM_PROMPT    "solos@sol$ "
 #define TERM_PROMPT_LEN 11u
 
+/* ---- notepad app ---- */
+
+#define NOTEPAD_MAX_TEXT   8192
+#define NOTEPAD_MAX_FNAME  64
+#define NOTEPAD_ROW_H      12
+#define NOTEPAD_BG         0x00FAFAFAu
+#define NOTEPAD_TEXT       0x001B2A4Au
+#define NOTEPAD_LINE_NUM   0x00808080u
+#define NOTEPAD_CHROME_H   30
+#define NOTEPAD_STATUSBAR_H 20
+#define NOTEPAD_MARGIN     6
+#define NOTEPAD_LINENUM_W  32
+
+#define NP_BTN_W 50
+#define NP_BTN_H 24
+#define NP_BTN_GAP 8
+
+#define FS_MAX_FILES 32
+#define FS_MAX_FDATA 4096
+
+struct fs_file {
+    char name[NOTEPAD_MAX_FNAME];
+    uint8_t data[FS_MAX_FDATA];
+    size_t len;
+    int used;
+};
+
+static struct fs_file g_fs[FS_MAX_FILES];
+
+static int fs_find(const char *name) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (g_fs[i].used && strcmp(g_fs[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int fs_create(const char *name) {
+    int idx = fs_find(name);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (!g_fs[i].used) {
+            g_fs[i].used = 1;
+            g_fs[i].len = 0;
+            int n = 0;
+            while (name[n] && n < NOTEPAD_MAX_FNAME - 1) {
+                g_fs[i].name[n] = name[n];
+                n++;
+            }
+            g_fs[i].name[n] = 0;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void fs_delete(int idx) {
+    if (idx < 0 || idx >= FS_MAX_FILES) return;
+    g_fs[idx].used = 0;
+    g_fs[idx].len = 0;
+    g_fs[idx].name[0] = 0;
+    memset(g_fs[idx].data, 0, sizeof(g_fs[idx].data));
+}
+
 #define ICON_W        72u
 #define ICON_H        72u
 #define ICON_X0       24
@@ -146,13 +209,30 @@ struct desktop_window {
     char br_input[TERM_LINE_MAX];  /* browser address-bar text */
     int br_input_len;
     int br_cursor_col;
+    int br_https;                     /* 1 if current request is HTTPS */
     int br_page;                      /* BR_PAGE_*: which page is shown */
-    int br_site_kind;                 /* BR_SITE_*: which site mock */
     char br_site_name[TERM_LINE_MAX]; /* domain or search query */
     char br_title[TERM_LINE_MAX];     /* tab title text */
     char br_web[BR_WEB_MAX];          /* fetched page text (body) */
     int br_web_len;                   /* bytes of body in br_web */
     int br_web_state;                 /* BR_WEB_*: fetch state */
+    /* notepad state */
+    char np_text[NOTEPAD_MAX_TEXT];
+    int np_len;
+    int np_cursor;
+    char np_fname[NOTEPAD_MAX_FNAME];
+    char np_title[NOTEPAD_MAX_FNAME + 8];
+    int np_dirty;
+    int np_file_idx;
+    int np_show_open;
+    int np_save_as;
+    char np_save_as_buf[NOTEPAD_MAX_FNAME];
+    int np_save_as_cursor;
+    /* file manager state */
+    int fm_sel;
+    int fm_scroll;
+    int fm_confirming;
+    int fm_confirm_idx;
 };
 
 static struct desktop_window g_wins[MAX_WINDOWS];
@@ -199,16 +279,6 @@ static const char *const ic_terminal_lines[] = {
     "For now this window exists to",
     "prove the desktop can launch.",
 };
-static const char *const ic_files_lines[] = {
-    "Files",
-    "Home",
-    "  Desktop",
-    "  Documents",
-    "  Downloads",
-    "  Pictures",
-    "  Music",
-    "  Videos",
-};
 static const char *const ic_settings_lines[] = {
     "Settings",
     "  Resolution: 1920x1080",
@@ -238,10 +308,11 @@ static const struct desktop_icon g_icons[] = {
      * background gradient, so the top-left of the desktop read as a
      * blank "gap". It is now a vivid blue that clearly stands out. */
     { "Terminal", '>', 0x00458BD9u, 1, "Terminal",    ic_terminal_lines, 4, 460, 220 },
-    { "Files",    'F', 0x00F5A623u, 0, "Files",       ic_files_lines,   8, 460, 220 },
+    { "Files",    'F', 0x00F5A623u, 4, "Files",       NULL,              0, 460, 220 },
     { "Settings", 'S', 0x003AAFA9u, 0, "Settings",    ic_settings_lines, 8, 460, 220 },
     { "About",    'A', 0x006B5B95u, 0, "About Sol OS", ic_about_lines,  6, 460, 220 },
     { "Browser",  'B', 0x00E5484Du, 2, "Browser",     NULL,              0, BROWSER_ICON_W, BROWSER_ICON_H },
+    { "Notepad",  'N', 0x0074BE8Du, 3, "Untitled",    NULL,              0, 500, 320 },
 };
 #define ICON_COUNT (unsigned)(sizeof(g_icons) / sizeof(g_icons[0]))
 
@@ -664,15 +735,10 @@ static void icon_open(int idx) {
  * blits whatever it needs. */
 static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
     int64_t x0, y0, x1, y1;
-    if (!bb_clip(x, y, w, h, &x0, &y0, &x1, &y1)) return;
+    if (!bb_clip(x, y, w, h, &x0, &y0, &x1, &y1)) {
+        return;
+    }
 
-    /* Scope every backbuffer write in this composite to the damaged
-     * region [x0,x1) x [y0,y1). Window rendering paints only the
-     * overlapping pixels too: since windows are composited in z-order
-     * and any window covering a damaged pixel necessarily intersects
-     * the region, the result is still correct occlusion, but no
-     * full-scene element (e.g. the icons) can clobber a window in the
-     * backbuffer it is not repainting. */
     int clip_was_active = g_bb_clip_active;
     int64_t sx0 = g_bb_clip_x0, sy0 = g_bb_clip_y0;
     int64_t sx1 = g_bb_clip_x1, sy1 = g_bb_clip_y1;
@@ -692,7 +758,6 @@ static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
 
     icon_draw();
 
-    /* Windows in z-order (ascending order field). */
     unsigned sorted[MAX_WINDOWS];
     int n = 0;
     for (unsigned i = 0; i < MAX_WINDOWS; i++) {
@@ -716,7 +781,6 @@ static void scene_region(int64_t x, int64_t y, int64_t w, int64_t h) {
         render_taskbar();
     }
 
-    /* The Start menu floats above everything else when open. */
     if (g_start_menu) {
         int64_t mx = menu_x();
         int64_t my = menu_y();
@@ -1229,30 +1293,11 @@ static void term_render(struct desktop_window *w, int active) {
 #define BR_PAGE_SITE   1
 #define BR_PAGE_SEARCH 2
 
-/* Which mock site is shown for BR_PAGE_SITE. */
-#define BR_SITE_GENERIC 0
-#define BR_SITE_YOUTUBE 1
-#define BR_SITE_GOOGLE  2
-
 /* Fetch state for real (non-mock) browser pages. */
 #define BR_WEB_IDLE 0
 #define BR_WEB_BUSY 1
 #define BR_WEB_OK   2
 #define BR_WEB_ERR  3
-
-/* Known-site table: a bare word ("youtube") or its domain both reach
- * the same mock page. Everything else becomes a search query. */
-struct br_site_def {
-    const char *word;
-    const char *domain;
-    const char *title;
-    int kind;
-};
-
-static const struct br_site_def br_sites[] = {
-    { "youtube", "youtube.com", "YouTube", BR_SITE_YOUTUBE },
-    { "google",  "google.com",  "Google",  BR_SITE_GOOGLE  },
-};
 
 /* Bounded copy; always NUL-terminates dst. */
 static void br_copy(char *dst, size_t n, const char *src) {
@@ -1327,8 +1372,9 @@ static void br_navigate(struct desktop_window *w) {
 
     /* A URL has no inner spaces; strip scheme + www and take the domain. */
     const char *s = tok;
+    int is_https = 0;
     if (br_prefix(s, "http://")) s += 7;
-    else if (br_prefix(s, "https://")) s += 8;
+    else if (br_prefix(s, "https://")) { s += 8; is_https = 1; }
     int has_space = 0;
     for (const char *q = s; *q; q++) if (*q == ' ' || *q == '\t') has_space = 1;
 
@@ -1342,21 +1388,11 @@ static void br_navigate(struct desktop_window *w) {
         dom[di] = 0;
         if (br_prefix(dom, "www.")) memmove(dom, dom + 4, strlen(dom + 4) + 1);
 
+        w->br_https = is_https;
+
         w->br_page = BR_PAGE_SITE;
-        w->br_site_kind = BR_SITE_GENERIC;
         br_copy(w->br_site_name, sizeof w->br_site_name, dom);
         br_copy(w->br_title, sizeof w->br_title, dom);
-        for (int k = 0; k < (int)(sizeof(br_sites) / sizeof(br_sites[0])); k++) {
-            /* A bare word ("youtube") or its domain ("youtube.com")
-             * both reach the same mock page. */
-            if (strcmp(dom, br_sites[k].domain) == 0 ||
-                strcmp(dom, br_sites[k].word) == 0) {
-                w->br_site_kind = br_sites[k].kind;
-                br_copy(w->br_title, sizeof w->br_title, br_sites[k].title);
-                w->br_web_state = BR_WEB_IDLE;
-                return;
-            }
-        }
         /* "sol.os" is this machine's virtual home page. */
         if (strcmp(dom, "sol.os") == 0 || strcmp(dom, "solos") == 0) {
             w->br_page = BR_PAGE_HOME;
@@ -1367,7 +1403,15 @@ static void br_navigate(struct desktop_window *w) {
         /* Everything else is fetched for real over the SLIRP gateway. */
         w->br_web_len = 0;
         w->br_web_state = BR_WEB_BUSY;
-        ns_http_get(dom, "/", w->br_web, sizeof w->br_web, br_web_done, w);
+        char url[TERM_LINE_MAX + 16];
+        const char *scheme = is_https ? "https://" : "http://";
+        br_copy(url, sizeof url, scheme);
+        size_t ulen = strlen(url);
+        br_copy(url + ulen, sizeof url - ulen, dom);
+        ulen = strlen(url);
+        url[ulen++] = '/';
+        url[ulen] = 0;
+        ns_http_get(url, "/", w->br_web, sizeof w->br_web, br_web_done, w);
         return;
     }
 
@@ -1574,16 +1618,25 @@ static void browser_web(int64_t cx, int64_t py, int64_t cw, int64_t ph,
 
     char banner[TERM_LINE_MAX + 24];
     size_t bi = 0;
+    const char *scheme = w->br_https ? "https" : "http";
     if (w->br_web_state == BR_WEB_BUSY) {
-        static const char pre[] = "Loading http://";
+        static const char pre[] = "Loading ";
         for (size_t k = 0; k < sizeof(pre) - 1 && bi < sizeof banner - 1; k++)
             banner[bi++] = pre[k];
+        for (const char *n = scheme; *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
+        banner[bi++] = ':';
+        banner[bi++] = '/';
+        banner[bi++] = '/';
         for (const char *n = w->br_site_name;
              *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
     } else if (w->br_web_state == BR_WEB_OK) {
-        static const char pre[] = "Fetched http://";
+        static const char pre[] = "Fetched ";
         for (size_t k = 0; k < sizeof(pre) - 1 && bi < sizeof banner - 1; k++)
             banner[bi++] = pre[k];
+        for (const char *n = scheme; *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
+        banner[bi++] = ':';
+        banner[bi++] = '/';
+        banner[bi++] = '/';
         for (const char *n = w->br_site_name;
              *n && bi < sizeof banner - 1; n++) banner[bi++] = *n;
         static const char mid[] = " - ";
@@ -1637,8 +1690,8 @@ static void browser_web(int64_t cx, int64_t py, int64_t cw, int64_t ph,
     br_wrap_text(cx + 16, py + 42, cw - 32, text, 0x00333333u);
 }
 
-/* Renders the BR_PAGE_SITE content: a YouTube mock, a Google mock, or
- * a generic preview page for any other domain. */
+/* Renders the BR_PAGE_SITE content: a generic preview page for any
+ * domain that is not handled by a real fetch. */
 static void browser_site(int64_t cx, int64_t py, int64_t cw, int64_t ph,
                          const struct desktop_window *w) {
     bb_fill_rect(cx, py, cw, ph, 0x00FFFFFFu);
@@ -1646,101 +1699,6 @@ static void browser_site(int64_t cx, int64_t py, int64_t cw, int64_t ph,
 
     if (w->br_web_state != BR_WEB_IDLE) {
         browser_web(cx, py, cw, ph, w);
-        return;
-    }
-
-    if (w->br_site_kind == BR_SITE_YOUTUBE) {
-        /* red masthead + decorative search pill */
-        int64_t hdr = 40;
-        bb_fill_rect(cx, py, cw, hdr, 0x00FF0000u);
-        bb_draw_string_scaled(cx + 18, py + (hdr - 2 * FONT_H) / 2,
-                              "YouTube", 0x00FFFFFFu, 2);
-        int64_t pill_w = 200, pill_h = 22;
-        int64_t pill_x = cx + cw - 18 - pill_w;
-        bb_fill_rect(pill_x, py + (hdr - pill_h) / 2, pill_w, pill_h, 0x00E5E5E5u);
-        bb_draw_string(pill_x + 8, py + (hdr - FONT_H) / 2, "Search", 0x00606060u);
-
-        int64_t y = py + hdr + 14;
-        bb_draw_string(cx + 18, y, "Recommended", 0x000F0F0Fu);
-        y += FONT_H + 10;
-
-        static const char *const titles[] = {
-            "Sol OS in 60 seconds",
-            "How the window manager works",
-            "The IST clock deep dive",
-            "Virtio-net, no wires",
-            "Framebuffer pixel art",
-            "Booting a 64-bit kernel",
-        };
-        static const char *const subs[] = {
-            "Sol OS  |  1.2M views",
-            "Sol OS  |  980K views",
-            "Sol OS  |  740K views",
-            "Sol OS  |  1.1M views",
-            "Sol OS  |  610K views",
-            "Sol OS  |  2.3M views",
-        };
-        static const uint32_t cols[] = {
-            0x00FF5A5Fu, 0x004B8BBEu, 0x007B4B9Au,
-            0x00E88C1Fu, 0x004CAF50u, 0x00E25B5Bu,
-        };
-        int64_t pad = 18, gap = 12;
-        int64_t card_w = (cw - pad * 2 - gap * 2) / 3;
-        int64_t thumb_h = card_w * 9 / 16;
-        if (thumb_h > 108) thumb_h = 108;
-        for (int r = 0; r < 2; r++) {
-            for (int k = 0; k < 3; k++) {
-                int idx = r * 3 + k;
-                if (idx >= (int)(sizeof(titles) / sizeof(titles[0]))) break;
-                int64_t tx = cx + pad + (int64_t)k * (card_w + gap);
-                int64_t ty = y + (int64_t)r * (thumb_h + FONT_H * 3 + 8);
-                if (ty + thumb_h + FONT_H * 3 + 6 > py + ph) break;
-                bb_fill_rect(tx, ty, card_w, thumb_h, cols[idx]);
-                bb_draw_char(tx + card_w / 2 - FONT_W / 2,
-                             ty + (thumb_h - FONT_H) / 2, '>', 0x00FFFFFFu);
-                bb_draw_string(tx, ty + thumb_h + 6, titles[idx], 0x000F0F0Fu);
-                bb_draw_string(tx, ty + thumb_h + 6 + FONT_H + 2,
-                               subs[idx], 0x00606060u);
-            }
-        }
-        return;
-    }
-
-    if (w->br_site_kind == BR_SITE_GOOGLE) {
-        /* colored per-letter wordmark */
-        const char *word = "Google";
-        static const uint32_t gcols[6] = {
-            0x004285F4u, 0x00EA4335u, 0x00FBBC05u,
-            0x004285F4u, 0x0034A853u, 0x00EA4335u,
-        };
-        int scale = 3;
-        int64_t wm_w = (int64_t)strlen(word) * FONT_W * scale;
-        int64_t wmy = py + 30;
-        for (int i = 0; word[i]; i++) {
-            char one[2] = { word[i], 0 };
-            bb_draw_string_scaled(cx + (cw - wm_w) / 2 + (int64_t)i * FONT_W * scale,
-                                  wmy, one, gcols[i], scale);
-        }
-        /* search bar */
-        int64_t sbw = 520;
-        if (sbw > cw - 60) sbw = cw - 60;
-        int64_t sby = wmy + FONT_H * scale + 26;
-        bb_fill_rect(cx + (cw - sbw) / 2, sby, sbw, 40, 0x00FFFFFFu);
-        bb_draw_rect(cx + (cw - sbw) / 2, sby, sbw, 40, 0x00DADCE0u);
-        bb_draw_string(cx + (cw - sbw) / 2 + 16, sby + (40 - FONT_H) / 2,
-                       "Search Google or type a URL", 0x008090A0u);
-        /* buttons */
-        int64_t b1w = 104, b2w = 140, by0 = sby + 40 + 16;
-        int64_t sum = b1w + 12 + b2w;
-        int64_t bx0 = cx + (cw - sum) / 2;
-        bb_fill_rect(bx0, by0, b1w, 32, 0x00F8F9FAu);
-        bb_draw_rect(bx0, by0, b1w, 32, 0x00DADCE0u);
-        bb_draw_string(bx0 + (b1w - 13 * FONT_W) / 2, by0 + (32 - FONT_H) / 2,
-                       "Google Search", 0x003C4043u);
-        bb_fill_rect(bx0 + b1w + 12, by0, b2w, 32, 0x00F8F9FAu);
-        bb_draw_rect(bx0 + b1w + 12, by0, b2w, 32, 0x00DADCE0u);
-        bb_draw_string(bx0 + b1w + 12 + (b2w - 17 * FONT_W) / 2,
-                       by0 + (32 - FONT_H) / 2, "I'm Feeling Lucky", 0x003C4043u);
         return;
     }
 
@@ -1828,6 +1786,559 @@ static void browser_search(int64_t cx, int64_t py, int64_t cw, int64_t ph,
     }
 }
 
+/* ---- notepad app ---- */
+
+static void np_init(struct desktop_window *w) {
+    w->np_len = 0;
+    w->np_cursor = 0;
+    w->np_fname[0] = 0;
+    w->np_title[0] = 0;
+    w->np_dirty = 0;
+    w->np_file_idx = -1;
+    w->np_show_open = 0;
+    w->np_save_as = 0;
+    w->np_save_as_cursor = 0;
+    w->np_save_as_buf[0] = 0;
+    w->np_text[0] = 0;
+}
+
+static int np_cursor_row(const struct desktop_window *w) {
+    int row = 0;
+    for (int i = 0; i < w->np_cursor && i < w->np_len; i++) {
+        if (w->np_text[i] == '\n') row++;
+    }
+    return row;
+}
+
+static int np_cursor_col(const struct desktop_window *w) {
+    int col = 0;
+    for (int i = w->np_cursor - 1; i >= 0 && w->np_text[i] != '\n'; i--) {
+        col++;
+    }
+    return col;
+}
+
+static void np_move_cursor(struct desktop_window *w, int delta) {
+    int new_pos = w->np_cursor + delta;
+    if (new_pos < 0) new_pos = 0;
+    if (new_pos > w->np_len) new_pos = w->np_len;
+    w->np_cursor = new_pos;
+}
+
+static void np_insert_char(struct desktop_window *w, char c) {
+    if (w->np_len >= NOTEPAD_MAX_TEXT - 1) return;
+    if (w->np_cursor < w->np_len) {
+        memmove(&w->np_text[w->np_cursor + 1], &w->np_text[w->np_cursor],
+                (size_t)(w->np_len - w->np_cursor));
+    }
+    w->np_text[w->np_cursor] = c;
+    w->np_len++;
+    w->np_cursor++;
+    w->np_dirty = 1;
+}
+
+static void np_delete_char(struct desktop_window *w) {
+    if (w->np_cursor > 0 && w->np_len > 0) {
+        memmove(&w->np_text[w->np_cursor - 1], &w->np_text[w->np_cursor],
+                (size_t)(w->np_len - w->np_cursor));
+        w->np_len--;
+        w->np_cursor--;
+        w->np_dirty = 1;
+    }
+}
+
+static void np_save(struct desktop_window *w) {
+    if (w->np_fname[0] == 0) {
+        const char *name = "untitled.txt";
+        int n = 0;
+        while (name[n] && n < NOTEPAD_MAX_FNAME - 1) {
+            w->np_fname[n] = name[n];
+            n++;
+        }
+        w->np_fname[n] = 0;
+    }
+    int idx = fs_find(w->np_fname);
+    if (idx < 0) idx = fs_create(w->np_fname);
+    if (idx >= 0) {
+        size_t to_copy = w->np_len;
+        if (to_copy > FS_MAX_FDATA) to_copy = FS_MAX_FDATA;
+        memcpy(g_fs[idx].data, w->np_text, to_copy);
+        g_fs[idx].len = to_copy;
+        w->np_file_idx = idx;
+        w->np_dirty = 0;
+        if (!w->np_title[0]) {
+            int ti = 0;
+            while (w->np_fname[ti] && ti < NOTEPAD_MAX_FNAME + 7) {
+                w->np_title[ti] = w->np_fname[ti]; ti++;
+            }
+            w->np_title[ti] = 0;
+            if (w->title != w->np_title) {
+                const char **title_slot = (const char **)&w->title;
+                *title_slot = w->np_title;
+            }
+        }
+    }
+}
+
+static void np_new(struct desktop_window *w) {
+    if (w->np_dirty) np_save(w);
+    w->np_len = 0;
+    w->np_cursor = 0;
+    w->np_fname[0] = 0;
+    w->np_title[0] = 0;
+    w->np_dirty = 0;
+    w->np_file_idx = -1;
+    w->np_text[0] = 0;
+    if (w->title != w->np_title) {
+        const char **title_slot = (const char **)&w->title;
+        *title_slot = w->np_title;
+    }
+}
+
+static void np_open_next(struct desktop_window *w) {
+    int next = -1;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (g_fs[i].used) {
+            if (next < 0) next = i;
+            if (i == w->np_file_idx) {
+                next = (i + 1) % FS_MAX_FILES;
+                while (next != i && !g_fs[next].used) next = (next + 1) % FS_MAX_FILES;
+                break;
+            }
+        }
+    }
+    if (next >= 0 && g_fs[next].used) {
+        if (w->np_dirty) np_save(w);
+        size_t to_copy = g_fs[next].len;
+        if (to_copy > NOTEPAD_MAX_TEXT - 1) to_copy = NOTEPAD_MAX_TEXT - 1;
+        memcpy(w->np_text, g_fs[next].data, to_copy);
+        w->np_text[to_copy] = 0;
+        w->np_len = (int)to_copy;
+        w->np_cursor = w->np_len;
+        w->np_file_idx = next;
+        int n = 0;
+        while (g_fs[next].name[n] && n < NOTEPAD_MAX_FNAME - 1) {
+            w->np_fname[n] = g_fs[next].name[n];
+            n++;
+        }
+        w->np_fname[n] = 0;
+        w->np_dirty = 0;
+    }
+}
+
+static void np_feed(struct desktop_window *w, unsigned char c) {
+    if (w->np_save_as) {
+        if (c == 27) {
+            w->np_save_as = 0;
+            w->np_save_as_buf[0] = 0;
+            w->np_save_as_cursor = 0;
+            redraw_rect(w->x, w->y, w->w, w->h);
+            return;
+        }
+        if (c == 10 || c == 13) {
+            char new_name[NOTEPAD_MAX_FNAME];
+            int ci = 0;
+            while (w->np_save_as_buf[ci] && ci < NOTEPAD_MAX_FNAME - 1) {
+                new_name[ci] = w->np_save_as_buf[ci]; ci++;
+            }
+            new_name[ci] = 0;
+            int valid = 1;
+            if (new_name[0] == 0) valid = 0;
+            for (int i = 0; new_name[i]; i++) {
+                char ch = new_name[i];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.')) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (valid) {
+                int old_idx = w->np_file_idx;
+                int existing = fs_find(new_name);
+                if (existing >= 0 && existing != old_idx) {
+                    fs_delete(existing);
+                }
+                int idx = fs_find(new_name);
+                if (idx < 0) idx = fs_create(new_name);
+                if (idx >= 0) {
+                    size_t to_copy = w->np_len;
+                    if (to_copy > FS_MAX_FDATA) to_copy = FS_MAX_FDATA;
+                    memcpy(g_fs[idx].data, w->np_text, to_copy);
+                    g_fs[idx].len = to_copy;
+                    w->np_file_idx = idx;
+                    w->np_dirty = 0;
+                    int ni = 0;
+                    while (new_name[ni] && ni < NOTEPAD_MAX_FNAME - 1) {
+                        w->np_fname[ni] = new_name[ni]; ni++;
+                    }
+                    w->np_fname[ni] = 0;
+                    int ti = 0;
+                    while (new_name[ti] && ti < NOTEPAD_MAX_FNAME + 7) {
+                        w->np_title[ti] = new_name[ti]; ti++;
+                    }
+                    w->np_title[ti] = 0;
+                    if (w->title != w->np_title) {
+                        const char **title_slot = (const char **)&w->title;
+                        *title_slot = w->np_title;
+                    }
+                }
+            }
+            w->np_save_as = 0;
+            w->np_save_as_buf[0] = 0;
+            w->np_save_as_cursor = 0;
+            redraw_rect(w->x, w->y, w->w, w->h);
+            return;
+        }
+        if (c == 8) {
+            if (w->np_save_as_cursor > 0) {
+                int i = w->np_save_as_cursor - 1;
+                while (w->np_save_as_buf[i]) {
+                    w->np_save_as_buf[i] = w->np_save_as_buf[i + 1]; i++;
+                }
+                w->np_save_as_cursor--;
+            }
+            return;
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            if (w->np_save_as_cursor < NOTEPAD_MAX_FNAME - 1) {
+                size_t len = 0;
+                while (w->np_save_as_buf[len] && len < NOTEPAD_MAX_FNAME - 1) len++;
+                if (len < (size_t)NOTEPAD_MAX_FNAME - 1) {
+                    if (w->np_save_as_cursor > (int)len) w->np_save_as_cursor = (int)len;
+                    for (size_t i = len + 1; i > (size_t)w->np_save_as_cursor; i--) {
+                        w->np_save_as_buf[i] = w->np_save_as_buf[i - 1];
+                    }
+                    w->np_save_as_buf[w->np_save_as_cursor] = (char)c;
+                    w->np_save_as_cursor++;
+                }
+            }
+            return;
+        }
+        return;
+    }
+    if (c >= 0x20 && c <= 0x7E) {
+        np_insert_char(w, (char)c);
+        return;
+    }
+    if (c == 8) { np_delete_char(w); return; }
+    if (c == 10) { np_insert_char(w, '\n'); return; }
+    if (c == 0x03) { np_move_cursor(w, -1); return; }
+    if (c == 0x04) { np_move_cursor(w, 1); return; }
+    if (c == 0x05) {
+        int row = np_cursor_row(w);
+        if (row > 0) {
+            int target = 0;
+            int cur_row = 0;
+            for (int i = 0; i < w->np_cursor && cur_row < row - 1; i++) {
+                if (w->np_text[i] == '\n') cur_row++;
+                target = i + 1;
+            }
+            if (target < w->np_cursor) np_move_cursor(w, target - w->np_cursor);
+        }
+        return;
+    }
+    if (c == 0x06) {
+        int row = np_cursor_row(w);
+        int target = w->np_cursor;
+        for (int i = w->np_cursor; i < w->np_len; i++) {
+            if (w->np_text[i] == '\n') {
+                if (row == np_cursor_row(w) - 1) break;
+                row++;
+            }
+            target = i + 1;
+        }
+        if (target > w->np_cursor) np_move_cursor(w, target - w->np_cursor);
+        return;
+    }
+}
+
+static int np_button_at(const struct desktop_window *w, int64_t px, int64_t py) {
+    int64_t toolbar_y = w->y + TITLE_H + 1;
+    if (py < toolbar_y || py >= toolbar_y + NOTEPAD_CHROME_H) return 0;
+    int64_t bx = w->x + w->w - BTN_MARGIN - NP_BTN_W;
+    if (px >= bx && px < bx + NP_BTN_W) return 's';
+    bx -= NP_BTN_W + NP_BTN_GAP;
+    if (px >= bx && px < bx + NP_BTN_W) return 'o';
+    bx -= NP_BTN_W + NP_BTN_GAP;
+    if (px >= bx && px < bx + NP_BTN_W) return 'a';
+    bx -= NP_BTN_W + NP_BTN_GAP;
+    if (px >= bx && px < bx + NP_BTN_W) return 'n';
+    return 0;
+}
+
+static void np_render_chrome(struct desktop_window *w, int active) {
+    int64_t x = w->x, y = w->y;
+    int64_t bw = w->w;
+    uint32_t title_tx = active ? TITLE_ACT_TEXT : TITLE_INACT_TEXT;
+    uint32_t btn_bg = active ? BTN_BG_ACT : BTN_BG_INACT;
+    int64_t toolbar_y = y + TITLE_H + 1;
+    bb_fill_rect(x + 1, toolbar_y, bw - 2, NOTEPAD_CHROME_H, 0x00F0F4F8u);
+    bb_draw_rect(x + 1, toolbar_y, bw - 2, NOTEPAD_CHROME_H, 0x00C0C8D4u);
+    if (w->np_save_as) {
+        char label[NOTEPAD_MAX_FNAME + 8];
+        int li = 0;
+        const char *pre = "Save As: ";
+        while (*pre && li < sizeof(label) - 1) label[li++] = *pre++;
+        int ci = 0;
+        while (w->np_save_as_buf[ci] && ci < NOTEPAD_MAX_FNAME && li < sizeof(label) - 2) {
+            label[li++] = w->np_save_as_buf[ci++];
+        }
+        label[li] = 0;
+        bb_draw_string(x + 10, toolbar_y + (NOTEPAD_CHROME_H - FONT_H) / 2, label, title_tx);
+    } else {
+        char title[NOTEPAD_MAX_FNAME + 4];
+        int ti = 0;
+        if (w->np_title[0]) {
+            int ti = 0;
+            while (w->np_title[ti] && ti < NOTEPAD_MAX_FNAME) { title[ti] = w->np_title[ti]; ti++; }
+            title[ti] = 0;
+        } else if (w->np_fname[0]) {
+            int ti = 0;
+            while (w->np_fname[ti] && ti < NOTEPAD_MAX_FNAME) { title[ti] = w->np_fname[ti]; ti++; }
+            title[ti] = 0;
+        } else {
+            const char *untitled = "Untitled";
+            int ti = 0;
+            while (untitled[ti] && ti < NOTEPAD_MAX_FNAME) { title[ti] = untitled[ti]; ti++; }
+            title[ti] = 0;
+        }
+        if (w->np_dirty) { title[ti++] = '*'; title[ti++] = ' '; }
+        title[ti] = 0;
+        bb_draw_string(x + 10, toolbar_y + (NOTEPAD_CHROME_H - FONT_H) / 2, title, title_tx);
+    }
+    int64_t c0 = x + bw - BTN_MARGIN - NP_BTN_W;
+    int64_t by = toolbar_y + (NOTEPAD_CHROME_H - NP_BTN_H) / 2;
+    bb_fill_rect(c0, by, NP_BTN_W, NP_BTN_H, btn_bg);
+    bb_draw_string(c0 + 8, by + (NP_BTN_H - FONT_H) / 2, "Save", BTN_GLYPH);
+    int64_t o0 = c0 - NP_BTN_W - NP_BTN_GAP;
+    bb_fill_rect(o0, by, NP_BTN_W, NP_BTN_H, btn_bg);
+    bb_draw_string(o0 + 8, by + (NP_BTN_H - FONT_H) / 2, "Open", BTN_GLYPH);
+    int64_t a0 = o0 - NP_BTN_W - NP_BTN_GAP;
+    bb_fill_rect(a0, by, NP_BTN_W, NP_BTN_H, btn_bg);
+    bb_draw_string(a0 + 8, by + (NP_BTN_H - FONT_H) / 2, "As", BTN_GLYPH);
+    int64_t n0 = a0 - NP_BTN_W - NP_BTN_GAP;
+    bb_fill_rect(n0, by, NP_BTN_W, NP_BTN_H, btn_bg);
+    bb_draw_string(n0 + 8, by + (NP_BTN_H - FONT_H) / 2, "New", BTN_GLYPH);
+}
+
+static void np_render(struct desktop_window *w, int active) {
+    int64_t x = w->x, y = w->y;
+    int64_t bw = w->w, bh = w->h;
+    np_render_chrome(w, active);
+    int64_t bx = x + 1;
+    int64_t by = y + 1 + TITLE_H + NOTEPAD_CHROME_H;
+    int64_t bw2 = bw - 2;
+    int64_t bh2 = bh - 2 - TITLE_H - NOTEPAD_CHROME_H - NOTEPAD_STATUSBAR_H;
+    bb_fill_rect(bx, by, bw2, bh2, NOTEPAD_BG);
+    int64_t rows = bh2 / NOTEPAD_ROW_H;
+    if (rows < 2) rows = 2;
+    int64_t cols = (bw2 - NOTEPAD_LINENUM_W - NOTEPAD_MARGIN * 2) / FONT_W;
+    if (cols < 8) cols = 8;
+    int top_row = 0;
+    int cursor_row = np_cursor_row(w);
+    if (cursor_row >= (int)rows) top_row = cursor_row - (int)rows + 1;
+    int start = 0;
+    for (int r = 0; r < top_row && start < w->np_len; r++) {
+        while (start < w->np_len && w->np_text[start] != '\n') start++;
+        if (start < w->np_len) start++;
+    }
+    int64_t tx = bx + NOTEPAD_LINENUM_W + NOTEPAD_MARGIN;
+    int64_t ty = by + 2;
+    for (int i = 0; i < rows && start < w->np_len; i++) {
+        int line_start = start;
+        int line_end = start;
+        while (line_end < w->np_len && w->np_text[line_end] != '\n') line_end++;
+        int len = line_end - line_start;
+        if (len > cols) len = cols;
+        int row_num = top_row + i + 1;
+        char num[8];
+        int ni = 0;
+        int tmp = row_num;
+        char rev[8];
+        int ri = 0;
+        do { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (tmp > 0);
+        while (ri > 0) num[ni++] = rev[--ri];
+        num[ni] = 0;
+        bb_draw_string(bx + 4, ty, num, NOTEPAD_LINE_NUM);
+        for (int k = 0; k < len; k++) {
+            bb_draw_char(tx + k * FONT_W, ty, w->np_text[line_start + k], NOTEPAD_TEXT);
+        }
+        start = line_end + 1;
+        ty += NOTEPAD_ROW_H;
+    }
+    if (active && (g_last_second & 1u)) {
+        int col = np_cursor_col(w);
+        int row = np_cursor_row(w) - top_row;
+        if (row >= 0 && row < rows) {
+            int64_t cx = tx + col * FONT_W;
+            int64_t cy = by + 2 + row * NOTEPAD_ROW_H;
+            if (cx < tx + cols * FONT_W) {
+                bb_fill_rect(cx, cy, FONT_W, NOTEPAD_ROW_H - 2, 0x00D0D8E0u);
+            }
+        }
+    }
+    int64_t sby = y + bh - NOTEPAD_STATUSBAR_H;
+    bb_fill_rect(x + 1, sby, bw2, NOTEPAD_STATUSBAR_H, 0x00E0E4E8u);
+    char status[48];
+    int si = 0;
+    const char *pre = "Ln ";
+    while (*pre) status[si++] = *pre++;
+    int row_num = np_cursor_row(w) + 1;
+    char rev[8];
+    int ri = 0;
+    do { rev[ri++] = '0' + (row_num % 10); row_num /= 10; } while (row_num > 0);
+    while (ri > 0) status[si++] = rev[--ri];
+    status[si++] = ',';
+    status[si++] = ' ';
+    const char *col_pre = "Col ";
+    while (*col_pre) status[si++] = *col_pre++;
+    int col = np_cursor_col(w) + 1;
+    ri = 0;
+    do { rev[ri++] = '0' + (col % 10); col /= 10; } while (col > 0);
+    while (ri > 0) status[si++] = rev[--ri];
+    status[si] = 0;
+    bb_draw_string(x + 8, sby + (NOTEPAD_STATUSBAR_H - FONT_H) / 2, status, 0x00405060u);
+}
+
+/* ---- file manager app ---- */
+
+static void fm_init(struct desktop_window *w) {
+    w->fm_sel = 0;
+    w->fm_scroll = 0;
+    w->fm_confirming = 0;
+    w->fm_confirm_idx = -1;
+}
+
+static int fm_count(void) {
+    int c = 0;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (g_fs[i].used) c++;
+    }
+    return c;
+}
+
+static int fm_nth(int idx) {
+    int c = 0;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (g_fs[i].used) {
+            if (c == idx) return i;
+            c++;
+        }
+    }
+    return -1;
+}
+
+static void fm_render(struct desktop_window *w, int active) {
+    int64_t x = w->x, y = w->y;
+    int64_t bw = w->w, bh = w->h;
+    uint32_t title_bg = active ? TITLE_ACTIVE : TITLE_INACT;
+    uint32_t title_tx = active ? TITLE_ACT_TEXT : TITLE_INACT_TEXT;
+    uint32_t btn_bg = active ? BTN_BG_ACT : BTN_BG_INACT;
+    bb_draw_rect(x, y, bw, bh, WIN_BORDER);
+    bb_fill_rect(x + 1, y + 1, bw - 2, TITLE_H, title_bg);
+    bb_draw_string(x + 7, y + (TITLE_H - FONT_H) / 2, w->title, title_tx);
+    int64_t c0 = x + bw - BTN_MARGIN - BTN_W;
+    int64_t d0 = c0 - BTN_W - BTN_GAP - 8;
+    int64_t by = y + 3;
+    bb_fill_rect(c0, by, BTN_W, BTN_H, btn_bg);
+    bb_draw_char(c0 + (BTN_W - FONT_W) / 2, by + (BTN_H - FONT_H) / 2, 'x', BTN_GLYPH);
+    bb_fill_rect(d0, by, BTN_W, BTN_H, w->fm_confirming ? 0x00F0A0A0u : btn_bg);
+    bb_draw_string(d0 + 4, by + (BTN_H - FONT_H) / 2, "Del", BTN_GLYPH);
+    int64_t bx = x + 1;
+    int64_t by2 = y + 1 + TITLE_H;
+    int64_t bw2 = bw - 2;
+    int64_t bh2 = bh - 2 - TITLE_H;
+    bb_fill_rect(bx, by2, bw2, bh2, BODY_BG);
+    int64_t rows = bh2 / FONT_H;
+    if (rows < 2) rows = 2;
+    int total = fm_count();
+    if (w->fm_sel >= total) w->fm_sel = total > 0 ? total - 1 : 0;
+    if (w->fm_scroll > w->fm_sel && w->fm_scroll > 0) w->fm_scroll = w->fm_sel;
+    while (w->fm_scroll + (int)rows <= w->fm_sel && w->fm_scroll < total) w->fm_scroll++;
+    while (w->fm_scroll > w->fm_sel && w->fm_scroll > 0) w->fm_scroll--;
+    int64_t ty = by2 + 4;
+    for (int i = 0; i < rows && (w->fm_scroll + i) < total; i++) {
+        int idx = fm_nth(w->fm_scroll + i);
+        if (idx < 0) break;
+        int64_t lx = bx + 8;
+        if (w->fm_sel == w->fm_scroll + i) {
+            bb_fill_rect(bx + 2, ty - 1, bw2 - 4, FONT_H + 2, 0x00D0D8E0u);
+        }
+        char size_str[16];
+        int si = 0;
+        const char *sz_pre = " (";
+        while (*sz_pre) size_str[si++] = *sz_pre++;
+        size_t len = g_fs[idx].len;
+        if (len == 0) { size_str[si++] = '0'; }
+        else {
+            char tmp[12];
+            int ti = 0;
+            do { tmp[ti++] = '0' + (len % 10); len /= 10; } while (len > 0);
+            while (ti > 0) size_str[si++] = tmp[--ti];
+        }
+        size_str[si++] = 'B';
+        size_str[si++] = ')';
+        size_str[si] = 0;
+        bb_draw_string(lx, ty, g_fs[idx].name, BODY_TEXT);
+        bb_draw_string(lx + bw2 - 80, ty, size_str, 0x00808080u);
+        ty += FONT_H + 2;
+    }
+    if (total == 0) {
+        bb_draw_string(bx + 8, by2 + bh2 / 2 - FONT_H / 2, "No files yet.", 0x00808080u);
+    }
+    if (w->fm_confirming) {
+        int idx = fm_nth(w->fm_confirm_idx);
+        int64_t dw = 340, dh = 120;
+        int64_t dx = x + (bw - dw) / 2;
+        int64_t dy = y + (bh - dh) / 2;
+        bb_fill_rect(dx, dy, dw, dh, 0x00FAFAFAu);
+        bb_draw_rect(dx, dy, dw, dh, 0x00C0C8D4u);
+        bb_draw_string(dx + 12, dy + 14, "Delete selected file?", 0x001B2A4Au);
+        if (idx >= 0) {
+            bb_draw_string(dx + 12, dy + 34, g_fs[idx].name, 0x00404040u);
+        }
+        bb_draw_string(dx + 12, dy + 60, "Press Y to confirm, N to cancel", 0x00404040u);
+        bb_fill_rect(dx + dw - BTN_MARGIN - BTN_W - 4, dy + dh - 36, BTN_W, BTN_H, 0x00D04040u);
+        bb_draw_string(dx + dw - BTN_MARGIN - BTN_W + 4, dy + dh - 30, "No", BTN_GLYPH);
+        bb_fill_rect(dx + 12, dy + dh - 36, BTN_W, BTN_H, 0x0040A0D0u);
+        bb_draw_string(dx + 22, dy + dh - 30, "Yes", BTN_GLYPH);
+    }
+}
+
+static void win_raise(int idx);
+
+static void fm_open_selected(struct desktop_window *w) {
+    int idx = fm_nth(w->fm_sel);
+    if (idx < 0) return;
+    int ni = win_open(g_fs[idx].name, w->x + 40, w->y + 40, 500, 320, 3, NULL, 0);
+    if (ni >= 0) {
+        struct desktop_window *np = &g_wins[ni];
+        size_t to_copy = g_fs[idx].len;
+        if (to_copy > NOTEPAD_MAX_TEXT - 1) to_copy = NOTEPAD_MAX_TEXT - 1;
+        memcpy(np->np_text, g_fs[idx].data, to_copy);
+        np->np_text[to_copy] = 0;
+        np->np_len = (int)to_copy;
+        np->np_cursor = np->np_len;
+        int n = 0;
+        while (g_fs[idx].name[n] && n < NOTEPAD_MAX_FNAME - 1) {
+            np->np_fname[n] = g_fs[idx].name[n]; n++;
+        }
+        np->np_fname[n] = 0;
+        n = 0;
+        while (g_fs[idx].name[n] && n < NOTEPAD_MAX_FNAME + 7) {
+            np->np_title[n] = g_fs[idx].name[n]; n++;
+        }
+        np->np_title[n] = 0;
+        if (np->title != np->np_title) {
+            const char **title_slot = (const char **)&np->title;
+            *title_slot = np->np_title;
+        }
+        np->np_file_idx = idx;
+        np->np_dirty = 0;
+        win_raise(ni);
+    }
+}
+
 /* ---- windows (drawing) ---- */
 
 static void win_render(struct desktop_window *w) {
@@ -1841,7 +2352,11 @@ static void win_render(struct desktop_window *w) {
     bb_draw_rect(x, y, bw, bh, WIN_BORDER);
     bb_fill_rect(x + 1, y + 1, bw - 2, TITLE_H, title_bg);
 
-    bb_draw_string(x + 7, y + (TITLE_H - FONT_H) / 2, w->title, title_tx);
+    if (w->kind == 3 && w->np_title[0]) {
+        bb_draw_string(x + 7, y + (TITLE_H - FONT_H) / 2, w->np_title, title_tx);
+    } else {
+        bb_draw_string(x + 7, y + (TITLE_H - FONT_H) / 2, w->title, title_tx);
+    }
 
     int64_t c0 = x + bw - BTN_MARGIN - BTN_W;
     int64_t m0 = c0 - BTN_W - BTN_GAP;
@@ -1946,6 +2461,16 @@ static void win_render(struct desktop_window *w) {
         return;
     }
 
+    if (w->kind == 3) {
+        np_render(w, active);
+        return;
+    }
+
+    if (w->kind == 4) {
+        fm_render(w, active);
+        return;
+    }
+
     bb_fill_rect(x + 1, y + 1 + TITLE_H, bw - 2, bh - 2 - TITLE_H, BODY_BG);
 
     int64_t lx = x + 8;
@@ -1960,9 +2485,9 @@ static void win_render(struct desktop_window *w) {
     if (!w->maximized) {
         int64_t gr = x + bw - 12;
         int64_t gb = y + bh - 12;
-        bb_fill_rect(gr, gb + 8, 10, 2, 0x00C0C8D4u);
-        bb_fill_rect(gr + 4, gb + 4, 10, 2, 0x00C0C8D4u);
-        bb_fill_rect(gr + 8, gb, 10, 2, 0x00C0C8D4u);
+        bb_fill_rect(gr, gb + 8, 8, 2, 0x00C0C8D4u);
+        bb_fill_rect(gr + 4, gb + 4, 8, 2, 0x00C0C8D4u);
+        bb_fill_rect(gr + 8, gb, 4, 2, 0x00C0C8D4u);
     }
 }
 
@@ -2008,11 +2533,14 @@ static int win_open(const char *title, int64_t x, int64_t y,
             memcpy(n->br_input, "sol.os/home", (size_t)n->br_input_len + 1);
             n->br_cursor_col = n->br_input_len;
             n->br_page = BR_PAGE_HOME;
-            n->br_site_kind = BR_SITE_GENERIC;
             n->br_web_len = 0;
             n->br_web_state = BR_WEB_IDLE;
             br_copy(n->br_site_name, sizeof n->br_site_name, "sol.os/home");
             br_copy(n->br_title, sizeof n->br_title, "sol.os/home");
+        } else if (kind == 3) {
+            np_init(n);
+        } else if (kind == 4) {
+            fm_init(n);
         } else {
             n->nlines = nlines > (int)MAX_WIN_LINES ? (int)MAX_WIN_LINES : nlines;
             for (int li = 0; li < n->nlines; li++) n->lines[li] = lines[li];
@@ -2158,6 +2686,96 @@ static void handle_left_press(int64_t px, int64_t py) {
     }
     struct desktop_window *w = &g_wins[wi];
 
+    if (w->kind == 3) {
+        char nb = np_button_at(w, px, py);
+        if (nb == 'n') { np_new(w); redraw_rect(w->x, w->y, w->w, w->h); return; }
+        if (nb == 'o') { np_open_next(w); redraw_rect(w->x, w->y, w->w, w->h); return; }
+        if (nb == 's') { np_save(w); redraw_rect(w->x, w->y, w->w, w->h); return; }
+        if (nb == 'a') {
+            if (!w->np_save_as) {
+                int ci = 0;
+                if (w->np_fname[0]) {
+                    while (w->np_fname[ci] && ci < NOTEPAD_MAX_FNAME - 1) {
+                        w->np_save_as_buf[ci] = w->np_fname[ci]; ci++;
+                    }
+                } else {
+                    const char *def = "untitled.txt";
+                    int di = 0;
+                    while (def[di] && di < NOTEPAD_MAX_FNAME - 1) {
+                        w->np_save_as_buf[ci++] = def[di++];
+                    }
+                }
+                w->np_save_as_buf[ci] = 0;
+                w->np_save_as_cursor = ci;
+                w->np_save_as = 1;
+            }
+            redraw_rect(w->x, w->y, w->w, w->h);
+            return;
+        }
+    }
+
+    if (w->kind == 4) {
+        if (w->fm_confirming) {
+            int64_t bw2 = w->w - 2;
+            int64_t bh2 = w->h - 2 - TITLE_H;
+            int64_t dw = 340, dh = 120;
+            int64_t dx = w->x + (bw2 - dw) / 2;
+            int64_t dy = w->y + (bh2 - dh) / 2;
+            int yes_x = dx + 12;
+            int yes_w = BTN_W;
+            int no_x = dx + dw - BTN_MARGIN - BTN_W - 4;
+            int btn_y = dy + dh - 36;
+            if (px >= yes_x && px < yes_x + yes_w && py >= btn_y && py < btn_y + BTN_H) {
+                int fidx = fm_nth(w->fm_confirm_idx);
+                if (fidx >= 0) {
+                    klog("[fm] delete confirmed: %s\n", g_fs[fidx].name);
+                    fs_delete(fidx);
+                    if (w->fm_sel >= fm_count()) w->fm_sel = fm_count() > 0 ? fm_count() - 1 : 0;
+                }
+                w->fm_confirming = 0;
+                w->fm_confirm_idx = -1;
+                redraw_rect(w->x, w->y, w->w, w->h);
+                return;
+            }
+            if (px >= no_x && px < no_x + BTN_W && py >= btn_y && py < btn_y + BTN_H) {
+                w->fm_confirming = 0;
+                w->fm_confirm_idx = -1;
+                redraw_rect(w->x, w->y, w->w, w->h);
+                return;
+            }
+            return;
+        }
+        int64_t bx = w->x + 1;
+        int64_t by2 = w->y + 1 + TITLE_H;
+        int64_t bh2 = w->h - 2 - TITLE_H;
+        int64_t rows = bh2 / FONT_H;
+        if (rows < 2) rows = 2;
+        int64_t c0 = w->x + w->w - BTN_MARGIN - BTN_W;
+        int64_t d0 = c0 - BTN_W - BTN_GAP - 8;
+        if (px >= d0 && px < d0 + BTN_W && py >= w->y + 3 && py < w->y + 3 + BTN_H) {
+            int idx = fm_nth(w->fm_sel);
+            if (idx >= 0) {
+                w->fm_confirming = 1;
+                w->fm_confirm_idx = w->fm_sel;
+                redraw_rect(w->x, w->y, w->w, w->h);
+            }
+            return;
+        }
+        if (px >= c0 && px < c0 + BTN_W && py >= w->y + 3 && py < w->y + 3 + BTN_H) {
+            win_close(wi);
+            return;
+        }
+        if (px >= bx && px < bx + w->w - 2 && py >= by2 && py < by2 + rows * FONT_H) {
+            int row = (int)((py - by2) / FONT_H);
+            int new_sel = w->fm_scroll + row;
+            if (new_sel < fm_count()) {
+                w->fm_sel = new_sel;
+                redraw_rect(w->x, w->y, w->w, w->h);
+            }
+            return;
+        }
+    }
+
     char btn = win_button_at(w, px, py);
     if (btn == 'c') {
         klog("[desktop] close '%s'\n", w->title);
@@ -2277,6 +2895,24 @@ void desktop_init(struct limine_framebuffer *fb, uint64_t hhdm) {
         "Terminal: 'help' lists commands.",
     };
     win_open("About Sol OS", 120, 90, 460, 240, 0, about_lines, 6);
+
+    memset(g_fs, 0, sizeof(g_fs));
+    int idx = fs_create("welcome.txt");
+    if (idx >= 0) {
+        const char *demo = "Welcome to Sol OS Notepad!\n\nThis is a simple text editor.\nTry typing, saving, and opening files.\n";
+        size_t dl = 0;
+        while (demo[dl]) dl++;
+        memcpy(g_fs[idx].data, demo, dl);
+        g_fs[idx].len = dl;
+    }
+    idx = fs_create("notes.txt");
+    if (idx >= 0) {
+        const char *demo = "Sol OS 0.1\n- Desktop with windows\n- Terminal emulator\n- Browser with live fetch\n- Notepad with file support\n";
+        size_t dl = 0;
+        while (demo[dl]) dl++;
+        memcpy(g_fs[idx].data, demo, dl);
+        g_fs[idx].len = dl;
+    }
 
     scene_region(0, 0, (int64_t)g_w, (int64_t)g_h);
 
@@ -2413,9 +3049,7 @@ void desktop_poll(void) {
 
     if (g_drag >= 0 && g_wins[g_drag].used && (dx != 0 || dy != 0)) {
         struct desktop_window *w = &g_wins[g_drag];
-        int64_t ox = w->x, oy = w->y, ow = w->w, oh = w->h;
         if (w->maximized) {
-            /* Dragging a maximized window restores it under the cursor. */
             w->x = w->rest_x;
             w->y = w->rest_y;
             w->w = w->rest_w;
@@ -2430,15 +3064,8 @@ void desktop_poll(void) {
         if (ny < 0) ny = 0;
         w->x = nx;
         w->y = ny;
-        redraw_union(ox, oy, ow, oh, nx, ny, w->w, w->h);
-        /* No redraw_taskbar() here: the union redraw is clamped to y <=
-         * work_h() (windows never extend into the taskbar strip), so the
-         * taskbar is untouched by the blit and its content (window
-         * buttons, active highlight, clock) does not change while a
-         * window is merely being moved. The active-highlight update
-         * happens once, in handle_left_press() via win_raise(). Skipping
-         * it here avoids recompositing + blitting the whole 1920px-wide
-         * taskbar strip on every mouse-move poll during a drag. */
+        scene_region(0, 0, (int64_t)g_w, (int64_t)g_h);
+        damage_add(0, 0, (int64_t)g_w, (int64_t)g_h);
     }
 
     if (g_resize >= 0 && g_wins[g_resize].used) {
@@ -2482,7 +3109,7 @@ void desktop_poll(void) {
         g_resize = -1;
     }
 
-    /* Keyboard input: forward to the focused terminal or browser. */
+    /* Keyboard input: forward to the focused terminal, browser or notepad. */
     char kch;
     while (virtio_keyboard_read_char(&kch)) {
         int top = win_topmost_index();
@@ -2493,6 +3120,38 @@ void desktop_poll(void) {
             term_feed(w, (unsigned char)kch);
         } else if (w->kind == 2) {
             br_feed(w, (unsigned char)kch);
+        } else if (w->kind == 3) {
+            np_feed(w, (unsigned char)kch);
+        } else if (w->kind == 4) {
+            if (w->fm_confirming) {
+                if (kch == 'y' || kch == 'Y') {
+                    int fidx = fm_nth(w->fm_confirm_idx);
+                    if (fidx >= 0) {
+                        klog("[fm] delete confirmed: %s\n", g_fs[fidx].name);
+                        fs_delete(fidx);
+                        if (w->fm_sel >= fm_count()) w->fm_sel = fm_count() > 0 ? fm_count() - 1 : 0;
+                    }
+                    w->fm_confirming = 0;
+                    w->fm_confirm_idx = -1;
+                } else if (kch == 'n' || kch == 'N' || kch == 27) {
+                    w->fm_confirming = 0;
+                    w->fm_confirm_idx = -1;
+                }
+            } else {
+                if (kch == 10 || kch == 13) {
+                    fm_open_selected(w);
+                } else if (kch == 0x05) {
+                    if (w->fm_sel > 0) w->fm_sel--;
+                } else if (kch == 0x06) {
+                    if (w->fm_sel < fm_count() - 1) w->fm_sel++;
+                } else if (kch == 127 || kch == 8) {
+                    int idx = fm_nth(w->fm_sel);
+                    if (idx >= 0) {
+                        w->fm_confirming = 1;
+                        w->fm_confirm_idx = w->fm_sel;
+                    }
+                }
+            }
         } else {
             continue;
         }
@@ -2514,6 +3173,11 @@ void desktop_poll(void) {
         /* blink the cursor of the focused terminal */
         int top = win_topmost_index();
         if (top >= 0 && g_wins[top].used && g_wins[top].kind == 1) {
+            redraw_rect(g_wins[top].x, g_wins[top].y,
+                        g_wins[top].w, g_wins[top].h);
+        }
+        /* blink the cursor of the focused notepad */
+        if (top >= 0 && g_wins[top].used && g_wins[top].kind == 3) {
             redraw_rect(g_wins[top].x, g_wins[top].y,
                         g_wins[top].w, g_wins[top].h);
         }

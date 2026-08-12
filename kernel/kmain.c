@@ -14,6 +14,7 @@
 #include "drivers/pci/pci.h"
 #include "drivers/virtio/virtio_input.h"
 #include "net.h"
+#include "netstack.h"
 #include "string.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -60,6 +61,16 @@ static void heap_selftest(void) {
     klog("Heap stats: used=%lu free=%lu\n",
          (unsigned long)kheap_used_bytes(),
          (unsigned long)kheap_free_bytes());
+}
+
+static char test_buf[4096];
+
+static void test_cb(void *ctx, int status, size_t off, size_t len) {
+    (void)ctx;
+    klog("[test] fetch done: status=%d off=%lu len=%lu\n", status, (unsigned long)off, (unsigned long)len);
+    if (status == NS_OK && len > 0 && off + len < sizeof(test_buf)) {
+        klog("[test] body: %.*s\n", (int)(len < 200 ? len : 200), test_buf + off);
+    }
 }
 
 void kmain(void) {
@@ -137,6 +148,9 @@ void kmain(void) {
     }
 
     desktop_init(fb, hhdm_offset);
+
+    klog("[test] starting HTTPS test fetch (httpbin)...\n");
+    ns_http_get("https://httpbin.org", "/", test_buf, sizeof test_buf, test_cb, NULL);
 
     /* Main loop: echo typed characters to serial, let the desktop
      * drain input and run the UI, and log a heartbeat every ~5

@@ -73,6 +73,9 @@ typedef struct virtio_input {
     int saw_keys;
     int saw_buttons;
 
+    /* Keyboard modifier state. */
+    uint8_t shift_state;
+
     /* Pointer-device accumulator, drained by virtio_mouse_get_delta().
      * Written in IRQ context (cli active); read with interrupts
      * disabled in the getter. */
@@ -90,11 +93,15 @@ typedef struct virtio_input {
     volatile uint64_t irq_count;
 } virtio_input_t;
 
+/* Keyboard modifier keycodes (Linux input event codes). */
+#define KEY_LEFT_SHIFT   0x2Au
+#define KEY_RIGHT_SHIFT  0x36u
+
 static virtio_input_t g_inputs[VIRTIO_INPUT_MAX_DEVICES];
 
 /* ---- key/button name helpers ---- */
 
-static char keycode_to_char(uint16_t code) {
+static char keycode_to_char(uint16_t code, uint8_t shift) {
     static const char map[128] = {
         [1]  = 27,                                   /* ESC */
         [2]  = '1', [3] = '2', [4] = '3', [5] = '4', [6] = '5',
@@ -110,8 +117,6 @@ static char keycode_to_char(uint16_t code) {
         [44] = 'z', [45] = 'x', [46] = 'c', [47] = 'v', [48] = 'b',
         [49] = 'n', [50] = 'm', [51] = ',', [52] = '.', [53] = '/',
         [57] = ' ',
-        /* Navigation keys map to sentinels the terminal understands
-         * (see virtio_keyboard_read_char in the header): */
         [103] = 0x05,                                 /* up */
         [104] = 0x01,                                 /* page up */
         [105] = 0x03,                                 /* left */
@@ -119,8 +124,34 @@ static char keycode_to_char(uint16_t code) {
         [108] = 0x06,                                 /* down */
         [109] = 0x02,                                 /* page down */
     };
-    if (code < 128) return map[code];
-    return 0;
+    static const char shifted[128] = {
+        [1]  = 27,
+        [2]  = '!', [3] = '@', [4] = '#', [5] = '$', [6] = '%',
+        [7]  = '^', [8] = '&', [9] = '*', [10] = '(', [11] = ')',
+        [12] = '_', [13] = '+', [14] = 8, [15] = 9,
+        [16] = 'Q', [17] = 'W', [18] = 'E', [19] = 'R', [20] = 'T',
+        [21] = 'Y', [22] = 'U', [23] = 'I', [24] = 'O', [25] = 'P',
+        [26] = '{', [27] = '}', [28] = 10,
+        [30] = 'A', [31] = 'S', [32] = 'D', [33] = 'F', [34] = 'G',
+        [35] = 'H', [36] = 'J', [37] = 'K', [38] = 'L',
+        [39] = ':', [40] = '"', [41] = '~',
+        [43] = '|',
+        [44] = 'Z', [45] = 'X', [46] = 'C', [47] = 'V', [48] = 'B',
+        [49] = 'N', [50] = 'M', [51] = '<', [52] = '>', [53] = '?',
+        [57] = ' ',
+        [103] = 0x05,
+        [104] = 0x01,
+        [105] = 0x03,
+        [106] = 0x04,
+        [108] = 0x06,
+        [109] = 0x02,
+    };
+    if (code >= 128) return 0;
+    if (shift != 0) {
+        char c = shifted[code];
+        if (c != 0) return c;
+    }
+    return map[code];
 }
 
 /* ---- keyboard character queue ---- */
@@ -227,7 +258,16 @@ static void virtio_input_handle_event(virtio_input_t *vi,
                 klog("[vinput%d] button %s down=%d\n", vi->index, button_name(ev->code), (int)ev->value);
             }
         } else {
-            char c = keycode_to_char(ev->code);
+            /* Track shift modifier state. */
+            if (ev->code == KEY_LEFT_SHIFT || ev->code == KEY_RIGHT_SHIFT) {
+                if (ev->value != 0) {
+                    vi->shift_state |= (uint8_t)(1u << (ev->code - KEY_LEFT_SHIFT));
+                } else {
+                    vi->shift_state &= (uint8_t)~(1u << (ev->code - KEY_LEFT_SHIFT));
+                }
+                break;
+            }
+            char c = keycode_to_char(ev->code, vi->shift_state);
             if (ev->value != 0) {
                 vi->saw_keys = 1;
                 if (c >= 0x20 && c <= 0x7E) {

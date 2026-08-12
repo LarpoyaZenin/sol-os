@@ -51,6 +51,7 @@ mkdir -p "$ISO_ROOT/boot/limine" "$ISO_ROOT/EFI/BOOT"
 
 cp "${BUILD_DIR}/kernel-rust.elf" "$ISO_ROOT/boot/kernel.elf"
 cp "${ROOT_DIR}/boot/limine.conf" "$ISO_ROOT/boot/limine/limine.conf"
+cp "${ROOT_DIR}/assets/wallpaper.png" "$ISO_ROOT/boot/wallpaper.png"
 
 cp "$LIMINE_DIR/limine-bios.sys" "$ISO_ROOT/boot/limine/"
 cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"

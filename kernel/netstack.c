@@ -1,5 +1,6 @@
 #include "netstack.h"
 #include "net.h"
+#include "tls.h"
 #include "klog.h"
 #include "arch/x86_64/timer.h"
 #include <stddef.h>
@@ -67,6 +68,7 @@ static uint8_t ns_my_mac[6];
 #define TCP_FIN  0x01u
 #define TCP_SYN  0x02u
 #define TCP_RST  0x04u
+#define TCP_PSH  0x08u
 #define TCP_ACK  0x10u
 
 /* ---- ARP cache ---- */
@@ -173,7 +175,8 @@ static void udp_send(uint16_t sport, uint16_t dport,
 
 #define NS_PH_DNS      0
 #define NS_PH_CONNECT  1
-#define NS_PH_TRANSFER 2
+#define NS_PH_TLS      2
+#define NS_PH_TRANSFER 3
 
 #define TCP_S_SYN_SENT  1
 #define TCP_S_ESTAB     2
@@ -196,6 +199,9 @@ struct ns_conn_t {
     size_t cap;
     ns_cb_t cb;
     void *ctx;
+
+    int use_tls;
+    int tls_sent;
 
     /* DNS */
     uint16_t dns_id;
@@ -227,15 +233,15 @@ struct ns_conn_t {
 static struct ns_conn_t ns_conn;
 static uint16_t ns_port_ctr;
 
-/* Emits a TCP segment on the active connection (dst port 80, routed
- * through the gateway MAC) with IP/TCP checksums. */
+/* Emits a TCP segment on the active connection (dst port 80 for HTTP,
+ * 443 for HTTPS; routed through the gateway MAC) with IP/TCP checksums. */
 static void ns_emit(uint8_t flags, uint32_t seq, uint32_t ack,
                     const void *pay, size_t plen) {
     uint8_t t[TCP_HLEN + 1500];
     if (plen > 1500) return;
     uint8_t *h = t;
     w16(h + 0, ns_conn.sport);
-    w16(h + 2, 80);
+    w16(h + 2, ns_conn.use_tls ? 443 : 80);
     w32(h + 4, seq);
     w32(h + 8, ack);
     h[12] = (uint8_t)((TCP_HLEN / 4) << 4);
@@ -248,6 +254,15 @@ static void ns_emit(uint8_t flags, uint32_t seq, uint32_t ack,
                          (uint16_t)(TCP_HLEN + plen));
     w16(h + 16, csum(h, TCP_HLEN + plen, ps));
     ip_send(0x06, ns_conn.dst_ip, arp_lookup(ns_gw_ip), t, TCP_HLEN + plen);
+}
+
+/* Send raw TCP payload (used by TLS layer). */
+void ns_tls_send(const void *data, size_t len) {
+    if (!ns_conn.active || ns_conn.tcp_state != TCP_S_ESTAB) return;
+    if (len > 1500) len = 1500;
+    ns_emit(TCP_PSH | TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt, data, len);
+    ns_conn.snd_nxt += (uint32_t)len;
+    ns_conn.last_send = timer_get_ticks();
 }
 
 static void ns_finish(int status) {
@@ -367,9 +382,14 @@ static void ns_send_request(void) {
         ns_conn.req[w] = 0;
         ns_conn.req_len = (size_t)w;
     }
-    ns_emit(TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt,
-            ns_conn.req, ns_conn.req_len);
-    ns_conn.snd_nxt += (uint32_t)ns_conn.req_len;
+    if (ns_conn.use_tls) {
+        klog("[net] sending TLS request (%u bytes)\n", (unsigned)ns_conn.req_len);
+        tls_send_app_data((const uint8_t *)ns_conn.req, ns_conn.req_len);
+    } else {
+        ns_emit(TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt,
+                ns_conn.req, ns_conn.req_len);
+        ns_conn.snd_nxt += (uint32_t)ns_conn.req_len;
+    }
     ns_conn.req_sent = 1;
     ns_conn.last_send = timer_get_ticks();
 }
@@ -382,21 +402,37 @@ static void tcp_handle(const uint8_t *seg, size_t n) {
     uint32_t seq = b32(seg + 4);
     uint32_t ack = b32(seg + 8);
     uint16_t doff = (uint16_t)((seg[12] >> 4) * 4);
-    if (doff < TCP_HLEN || doff > n) return;
+    uint16_t ip_tlen = n;
+    if (n < doff) return;
     size_t dlen = n - doff;
     const uint8_t *dp = seg + doff;
+    klog("[net] tcp f=%u seq=%u ack=%u doff=%u iplen=%u dlen=%lu ",
+         (unsigned)flags, (unsigned)seq, (unsigned)ack,
+         (unsigned)doff, (unsigned)ip_tlen, (unsigned long)dlen);
+    for (size_t i = 0; i < dlen && i < 8; i++) klog("%u ", (unsigned)dp[i]);
+    klog("raw=");
+    for (size_t i = 0; i < n && i < 20; i++) klog("%u ", (unsigned)seg[i]);
+    klog("\n");
 
     if (ns_conn.tcp_state == TCP_S_SYN_SENT) {
         if (!(flags & TCP_SYN) || !(flags & TCP_ACK)) return;
         if (ack != ns_conn.isn + 1) return;
         if (flags & TCP_RST) { ns_finish(NS_ERR_CONN); return; }
+        klog("[net] tcp SYN-ACK received\n");
         ns_conn.rcv_nxt = seq + 1;
         ns_conn.tcp_state = TCP_S_ESTAB;
-        ns_conn.phase = NS_PH_TRANSFER;
-        klog("[net] tcp connected to %u.%u.%u.%u\n",
-             ns_conn.dst_ip[0], ns_conn.dst_ip[1],
-             ns_conn.dst_ip[2], ns_conn.dst_ip[3]);
-        ns_send_request();              /* also ACKs the SYN-ACK */
+        if (ns_conn.use_tls) {
+            ns_conn.phase = NS_PH_TLS;
+            klog("[net] tls handshake start %s\n", ns_conn.host);
+            tls_connect(ns_conn.host, NULL, 0, NULL, NULL);
+            ns_emit(TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt, NULL, 0);
+        } else {
+            ns_conn.phase = NS_PH_TRANSFER;
+            klog("[net] tcp connected to %u.%u.%u.%u\n",
+                 ns_conn.dst_ip[0], ns_conn.dst_ip[1],
+                 ns_conn.dst_ip[2], ns_conn.dst_ip[3]);
+            ns_send_request();
+        }
         return;
     }
 
@@ -416,47 +452,97 @@ static void tcp_handle(const uint8_t *seg, size_t n) {
 
     size_t adv = 0;
     if (dlen && seq == ns_conn.rcv_nxt) {
-        size_t room = ns_conn.cap - ns_conn.got;
-        size_t take = dlen > room ? room : dlen;
-        if (take) {
-            memcpy(ns_conn.buf + ns_conn.got, dp, take);
-            ns_conn.got += take;
-        }
-        ns_conn.rcv_nxt += (uint32_t)take;
-        adv = take;
-
-        if (!ns_conn.hdr_done) {
-            size_t scan = ns_conn.got < NS_HDR_MAX ? ns_conn.got : NS_HDR_MAX;
-            for (size_t i = 3; i < scan; i++) {
-                if (ns_conn.buf[i - 3] == '\r' && ns_conn.buf[i - 2] == '\n' &&
-                    ns_conn.buf[i - 1] == '\r' && ns_conn.buf[i] == '\n') {
-                    ns_conn.hdr_done = 1;
-                    ns_conn.hdr_end = i + 1;
-                    if (ns_conn.hdr_end >= 12 &&
-                        ns_conn.buf[0] == 'H' && ns_conn.buf[1] == 'T' &&
-                        ns_conn.buf[2] == 'T' && ns_conn.buf[3] == 'P') {
-                        int c1 = ns_conn.buf[9];
-                        int c2 = ns_conn.buf[10];
-                        int c3 = ns_conn.buf[11];
-                        if (c1 >= '0' && c1 <= '9' && c2 >= '0' && c2 <= '9' &&
-                            c3 >= '0' && c3 <= '9') {
-                            ns_conn.http_status = (c1 - '0') * 100 +
-                                                  (c2 - '0') * 10 + (c3 - '0');
+        if (ns_conn.phase == NS_PH_TLS) {
+            klog("[tls] feed: %u bytes, flags=%02x\n", (unsigned)dlen, flags);
+            if (dlen > 0) {
+                klog("[https] received %u encrypted bytes\n", (unsigned)dlen);
+            }
+            klog("[tls] data: ");
+            for (size_t i = 0; i < dlen && i < 32; i++) {
+                klog("%u ", (unsigned)dp[i]);
+            }
+            klog("\n");
+            tls_feed(dp, dlen);
+            tls_poll();
+            if (tls_app_ready()) {
+                klog("[https] TLS app data ready (%lu bytes)\n",
+                     (unsigned long)tls_app_len());
+                tls_clear_app_ready();
+                size_t take = tls_app_len() < ns_conn.cap ? tls_app_len() : ns_conn.cap;
+                take = tls_copy_app_data((uint8_t *)ns_conn.buf, take);
+                ns_conn.got = take;
+                tls_clear_app_len();
+                if (!ns_conn.hdr_done && ns_conn.got >= 4) {
+                    size_t scan = ns_conn.got < NS_HDR_MAX ? ns_conn.got : NS_HDR_MAX;
+                    for (size_t i = 3; i < scan; i++) {
+                        if (ns_conn.buf[i - 3] == '\r' && ns_conn.buf[i - 2] == '\n' &&
+                            ns_conn.buf[i - 1] == '\r' && ns_conn.buf[i] == '\n') {
+                            ns_conn.hdr_done = 1;
+                            ns_conn.hdr_end = i + 1;
+                            if (ns_conn.hdr_end >= 12 &&
+                                ns_conn.buf[0] == 'H' && ns_conn.buf[1] == 'T' &&
+                                ns_conn.buf[2] == 'T' && ns_conn.buf[3] == 'P') {
+                                int c1 = ns_conn.buf[9];
+                                int c2 = ns_conn.buf[10];
+                                int c3 = ns_conn.buf[11];
+                                if (c1 >= '0' && c1 <= '9' && c2 >= '0' && c2 <= '9' &&
+                                    c3 >= '0' && c3 <= '9') {
+                                    ns_conn.http_status = (c1 - '0') * 100 +
+                                                          (c2 - '0') * 10 + (c3 - '0');
+                                    klog("[https] HTTP status=%d\n", ns_conn.http_status);
+                                }
+                            }
+                            break;
                         }
                     }
-                    break;
                 }
             }
-        }
-
-        if (take < dlen) {
-            /* buffer full: ack what we consumed and finish */
+            ns_conn.rcv_nxt += (uint32_t)dlen;
+            adv = dlen;
             ns_emit(TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt, NULL, 0);
-            klog("[net] http %s status=%d bytes=%lu (truncated)\n",
-                 ns_conn.host, ns_conn.http_status, (unsigned long)ns_conn.got);
-            ns_finish(ns_conn.http_status >= 200 && ns_conn.http_status < 400
-                          ? NS_OK : NS_ERR_HTTP);
-            return;
+        } else {
+            size_t room = ns_conn.cap - ns_conn.got;
+            size_t take = dlen > room ? room : dlen;
+            if (take) {
+                memcpy(ns_conn.buf + ns_conn.got, dp, take);
+                ns_conn.got += take;
+            }
+            ns_conn.rcv_nxt += (uint32_t)take;
+            adv = take;
+
+            if (!ns_conn.hdr_done) {
+                size_t scan = ns_conn.got < NS_HDR_MAX ? ns_conn.got : NS_HDR_MAX;
+                for (size_t i = 3; i < scan; i++) {
+                    if (ns_conn.buf[i - 3] == '\r' && ns_conn.buf[i - 2] == '\n' &&
+                        ns_conn.buf[i - 1] == '\r' && ns_conn.buf[i] == '\n') {
+                        ns_conn.hdr_done = 1;
+                        ns_conn.hdr_end = i + 1;
+                        if (ns_conn.hdr_end >= 12 &&
+                            ns_conn.buf[0] == 'H' && ns_conn.buf[1] == 'T' &&
+                            ns_conn.buf[2] == 'T' && ns_conn.buf[3] == 'P') {
+                            int c1 = ns_conn.buf[9];
+                            int c2 = ns_conn.buf[10];
+                            int c3 = ns_conn.buf[11];
+                            if (c1 >= '0' && c1 <= '9' && c2 >= '0' && c2 <= '9' &&
+                                c3 >= '0' && c3 <= '9') {
+                                ns_conn.http_status = (c1 - '0') * 100 +
+                                                      (c2 - '0') * 10 + (c3 - '0');
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (take < dlen) {
+                /* buffer full: ack what we consumed and finish */
+                ns_emit(TCP_ACK, ns_conn.snd_nxt, ns_conn.rcv_nxt, NULL, 0);
+                klog("[net] http %s status=%d bytes=%lu (truncated)\n",
+                     ns_conn.host, ns_conn.http_status, (unsigned long)ns_conn.got);
+                ns_finish(ns_conn.http_status >= 200 && ns_conn.http_status < 400
+                              ? NS_OK : NS_ERR_HTTP);
+                return;
+            }
         }
     } else if (dlen) {
         /* out of order: re-ACK what we already have */
@@ -466,6 +552,63 @@ static void tcp_handle(const uint8_t *seg, size_t n) {
 
     if (flags & TCP_FIN) {
         ns_conn.rcv_nxt++;
+        if (ns_conn.phase == NS_PH_TLS) {
+            klog("[net] tls FIN received\n");
+            int had_app = 0;
+            if (tls_app_ready() || tls_app_len() > 0) {
+                had_app = 1;
+                tls_clear_app_ready();
+                size_t take = tls_app_len() < ns_conn.cap ? tls_app_len() : ns_conn.cap;
+                take = tls_copy_app_data((uint8_t *)ns_conn.buf, take);
+                ns_conn.got = take;
+                tls_clear_app_len();
+                if (!ns_conn.hdr_done && ns_conn.got >= 4) {
+                    size_t scan = ns_conn.got < NS_HDR_MAX ? ns_conn.got : NS_HDR_MAX;
+                    for (size_t i = 3; i < scan; i++) {
+                        if (ns_conn.buf[i - 3] == '\r' && ns_conn.buf[i - 2] == '\n' &&
+                            ns_conn.buf[i - 1] == '\r' && ns_conn.buf[i] == '\n') {
+                            ns_conn.hdr_done = 1;
+                            ns_conn.hdr_end = i + 1;
+                            if (ns_conn.hdr_end >= 12 &&
+                                ns_conn.buf[0] == 'H' && ns_conn.buf[1] == 'T' &&
+                                ns_conn.buf[2] == 'T' && ns_conn.buf[3] == 'P') {
+                                int c1 = ns_conn.buf[9];
+                                int c2 = ns_conn.buf[10];
+                                int c3 = ns_conn.buf[11];
+                                if (c1 >= '0' && c1 <= '9' && c2 >= '0' && c2 <= '9' &&
+                                    c3 >= '0' && c3 <= '9') {
+                                    ns_conn.http_status = (c1 - '0') * 100 +
+                                                          (c2 - '0') * 10 + (c3 - '0');
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            ns_emit(TCP_ACK | TCP_FIN, ns_conn.snd_nxt, ns_conn.rcv_nxt, NULL, 0);
+            klog("[net] https %s status=%d bytes=%lu hdr_done=%d had_app=%d\n",
+                 ns_conn.host, ns_conn.http_status, (unsigned long)ns_conn.got,
+                 ns_conn.hdr_done, had_app);
+            {
+                const char *d = ns_conn.buf;
+                size_t nn = ns_conn.got < 40 ? ns_conn.got : 40;
+                klog("[net] dump: ");
+                for (size_t i = 0; i < nn; i++) {
+                    klog("%x ", (unsigned)(unsigned char)d[i]);
+                }
+                klog("\n");
+            }
+            if (had_app && ns_conn.hdr_done &&
+                ns_conn.http_status >= 200 && ns_conn.http_status < 400) {
+                ns_finish(NS_OK);
+            } else if (had_app) {
+                ns_finish(NS_ERR_HTTP);
+            } else {
+                ns_finish(NS_ERR_CONN);
+            }
+            return;
+        }
         ns_emit(TCP_ACK | TCP_FIN, ns_conn.snd_nxt, ns_conn.rcv_nxt, NULL, 0);
         klog("[net] http %s status=%d bytes=%lu hdr_done=%d\n",
              ns_conn.host, ns_conn.http_status, (unsigned long)ns_conn.got,
@@ -494,14 +637,14 @@ static void rx_ipv4(const uint8_t *p, size_t n) {
     uint8_t ihl = (uint8_t)((p[0] & 0x0F) * 4);
     if (ihl < IPV4_HLEN || ihl > n) return;
     uint8_t proto = p[9];
-    /* Use the IP total-length field: QEMU pads short ethernet frames to
-     * the 60-byte minimum and reports the padded length, which would
-     * otherwise leak padding bytes into the transport segment. */
     uint16_t tlen = b16(p + 2);
     if (tlen < ihl) return;
     size_t plen = (size_t)tlen - ihl;
     if (plen > n - ihl) plen = n - ihl;
     const uint8_t *pay = p + ihl;
+    klog("[net] ip proto=%u ihl=%u tlen=%u plen=%lu dst=%u.%u.%u.%u\n",
+         (unsigned)proto, (unsigned)ihl, (unsigned)tlen,
+         (unsigned long)plen, p[16], p[17], p[18], p[19]);
 
     if (proto == 0x11 && plen >= UDP_HLEN) {
         uint16_t dport = b16(pay + 2);
@@ -512,6 +655,9 @@ static void rx_ipv4(const uint8_t *p, size_t n) {
         uint16_t dport = b16(pay + 2);
         if (ns_conn.active && dport == ns_conn.sport) {
             tcp_handle(pay, plen);
+        } else if (ns_conn.active && dport == 443) {
+            klog("[net] ip tcp from server dport=%u sport=%u\n",
+                 (unsigned)dport, (unsigned)b16(pay));
         }
     }
 }
@@ -519,6 +665,7 @@ static void rx_ipv4(const uint8_t *p, size_t n) {
 static void rx_frame(const uint8_t *f, size_t n) {
     if (n < ETH_HLEN) return;
     uint16_t type = b16(f + 12);
+    klog("[net] frame type=%u len=%lu\n", (unsigned)type, (unsigned long)n);
     const uint8_t *p = f + ETH_HLEN;
     size_t plen = n - ETH_HLEN;
 
@@ -547,9 +694,20 @@ int ns_http_get(const char *host, const char *path,
     ns_conn.cap = cap;
     ns_conn.cb = cb;
     ns_conn.ctx = ctx;
+
+    /* Detect https:// and strip the scheme. */
+    if (host && memcmp(host, "https://", 8) == 0) {
+        ns_conn.use_tls = 1;
+        host += 8;
+    } else if (host && memcmp(host, "http://", 7) == 0) {
+        ns_conn.use_tls = 0;
+        host += 7;
+    }
+
+    /* Strip any path/query/fragment from host. */
     if (host) {
         size_t i = 0;
-        while (host[i] && i + 1 < sizeof ns_conn.host) {
+        while (host[i] && host[i] != '/' && host[i] != '?' && host[i] != '#') {
             ns_conn.host[i] = host[i];
             i++;
         }
@@ -572,7 +730,11 @@ int ns_http_get(const char *host, const char *path,
     ns_conn.snd_nxt = ns_conn.isn + 1;
     ns_conn.deadline = timer_get_ticks() + NS_DEADLINE;
     memcpy(ns_my_mac, net_mac(), 6);
-    klog("[net] get http://%s%s\n", ns_conn.host, ns_conn.path);
+    klog("[net] get %s://%s%s\n", ns_conn.use_tls ? "https" : "http",
+         ns_conn.host, ns_conn.path);
+    if (ns_conn.use_tls) {
+        klog("[https] connecting host=%s port=443\n", ns_conn.host);
+    }
     return 0;
 }
 
@@ -583,7 +745,12 @@ void ns_abort(void *ctx) {
     }
 }
 
+int ns_is_active(void) {
+    return ns_conn.active;
+}
+
 void ns_poll(void) {
+    net_poll();
     uint8_t f[1526];
     size_t n;
     while (net_receive(f, sizeof f, &n)) rx_frame(f, n);
@@ -598,6 +765,7 @@ void ns_poll(void) {
     }
 
     if (ns_conn.phase == NS_PH_DNS) {
+        ns_conn.retries = 0;
         if (!ns_conn.dns_sent) {
             if (arp_lookup(ns_dns_ip)) {
                 dns_send_query();
@@ -618,6 +786,7 @@ void ns_poll(void) {
     }
 
     if (ns_conn.phase == NS_PH_CONNECT) {
+        ns_conn.retries = 0;
         if (!arp_lookup(ns_gw_ip)) {
             if ((int)(now - ns_conn.last_send) >= NS_RETRY) {
                 arp_request(ns_gw_ip);
@@ -627,6 +796,12 @@ void ns_poll(void) {
         }
         if (ns_conn.tcp_state != TCP_S_SYN_SENT) {
             ns_conn.tcp_state = TCP_S_SYN_SENT;
+            klog("[net] tcp SYN sent to %u.%u.%u.%u\n",
+                 ns_conn.dst_ip[0], ns_conn.dst_ip[1],
+                 ns_conn.dst_ip[2], ns_conn.dst_ip[3]);
+            if (ns_conn.use_tls) {
+                klog("[https] SYN sent, awaiting SYN-ACK for TLS\n");
+            }
             ns_emit(TCP_SYN, ns_conn.isn, 0, NULL, 0);
             ns_conn.last_send = now;
         } else if ((int)(now - ns_conn.last_send) >= NS_RETRY) {
@@ -637,6 +812,33 @@ void ns_poll(void) {
             }
             ns_emit(TCP_SYN, ns_conn.isn, 0, NULL, 0);
             ns_conn.last_send = now;
+        }
+        return;
+    }
+
+    if (ns_conn.phase == NS_PH_TLS) {
+        if (!ns_conn.tls_sent) {
+            tls_poll();
+            if (tls_is_established()) {
+                klog("[net] TLS established, sending request\n");
+                if (ns_conn.use_tls) {
+                    klog("[https] sending encrypted HTTP request (%u bytes)\n",
+                         (unsigned)ns_conn.req_len);
+                }
+                ns_send_request();
+                ns_conn.tls_sent = 1;
+                ns_conn.retries = 0;
+            } else if (!tls_is_active()) {
+                klog("[net] tls handshake failed %s\n", ns_conn.host);
+                ns_finish(NS_ERR_TLS);
+                return;
+            }
+            return;
+        }
+        if (now >= ns_conn.deadline) {
+            klog("[net] tls transfer timeout %s\n", ns_conn.host);
+            ns_finish(NS_ERR_CONN);
+            return;
         }
         return;
     }

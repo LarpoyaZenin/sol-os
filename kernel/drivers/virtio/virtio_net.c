@@ -229,7 +229,9 @@ static void net_handle_frame(const uint8_t *frame, size_t len) {
 int net_send(const void *data, size_t len) {
     if (!g_net.present) return -1;
     if (len < 14 || len > VIRTIO_NET_MTU) return -1;
-    if ((g_net.status & VIRTIO_NET_S_LINK_UP) == 0) {
+    uint16_t status = (uint16_t)(virtio_device_cfg_read8(&g_net.vdev, 6) |
+                                 (uint16_t)virtio_device_cfg_read8(&g_net.vdev, 7) << 8);
+    if ((status & VIRTIO_NET_S_LINK_UP) == 0) {
         g_net.tx_dropped++;
         return -1;
     }
@@ -276,7 +278,10 @@ int net_receive(void *buf, size_t cap, size_t *out_len) {
 }
 
 int net_link_up(void) {
-    return (g_net.status & VIRTIO_NET_S_LINK_UP) != 0;
+    if (!g_net.present) return 0;
+    uint16_t status = (uint16_t)(virtio_device_cfg_read8(&g_net.vdev, 6) |
+                                 (uint16_t)virtio_device_cfg_read8(&g_net.vdev, 7) << 8);
+    return (status & VIRTIO_NET_S_LINK_UP) != 0;
 }
 
 int net_present(void) { return g_net.present; }
