@@ -53,7 +53,7 @@ pub fn pixel(x: i64, y: i64) -> u32 {
 /// canaries. Returns false on allocation failure.
 pub fn init(w: i64, h: i64) -> bool {
     let bytes = (w as u64) * (h as u64) * 4;
-    let ptr = kheap::kmalloc(bytes + BB_GUARD_BYTES);
+    let ptr = kheap::kmalloc((bytes + BB_GUARD_BYTES) as usize);
     if ptr.is_null() {
         return false;
     }
@@ -338,9 +338,9 @@ pub fn gradient_color(y: i64, h: i64) -> u32 {
     } else {
         ((y as u64) * 255u64 / ((h - 1) as u64)) as u32
     };
-    let r = r0 + (r1 - r0) * t / 255;
-    let g = g0 + (g1 - g0) * t / 255;
-    let b = b0 + (b1 - b0) * t / 255;
+    let r = r0.wrapping_add((r1.wrapping_sub(r0)).wrapping_mul(t).wrapping_div(255));
+    let g = g0.wrapping_add((g1.wrapping_sub(g0)).wrapping_mul(t).wrapping_div(255));
+    let b = b0.wrapping_add((b1.wrapping_sub(b0)).wrapping_mul(t).wrapping_div(255));
     (r << 16) | (g << 8) | b
 }
 
@@ -403,14 +403,14 @@ pub fn blit_src(src: *const u32, sw: i64, sh: i64, dx0: i64, dy0: i64, dw: i64, 
                 if sy < 0 || sy >= sh {
                     continue;
                 }
-                let src_row = src.add((sy as usize * sw as usize) as isize);
+                let src_row = src.add(sy as usize * sw as usize);
                 let dst_row = BB.offset((yy as usize * g_w as usize) as isize);
                 for xx in x0..x1 {
                     let sx = xx - dx0;
-                    if sx < 0 || sx >= sw {
+                    if sx < 0 || sx >= sh {
                         continue;
                     }
-                    *dst_row.add(xx as isize) = *src_row.add(sx as isize);
+                    *dst_row.add(xx as usize) = *src_row.add(sx as usize);
                 }
             }
         }

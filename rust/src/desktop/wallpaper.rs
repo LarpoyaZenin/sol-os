@@ -31,15 +31,15 @@ pub fn init() -> bool {
     let mut found: *mut requests::LimineFile = core::ptr::null_mut();
     let mut found_path = "";
     for i in 0..mr.module_count as usize {
-        let file = unsafe { (*mr.modules).add(i).read() };
-        let path = if file.is_null() {
+        let file_ptr = unsafe { (*mr.modules).add(i) };
+        let path = if file_ptr.is_null() {
             ""
         } else {
-            cstr_to_str(unsafe { (*file).path })
+            cstr_to_str(unsafe { (*file_ptr).path })
         };
         crate::kprintln!("[wallpaper] module {}: '{}'", i, path);
         if path.contains("wallpaper") {
-            found = file;
+            found = file_ptr;
             found_path = path;
             break;
         }

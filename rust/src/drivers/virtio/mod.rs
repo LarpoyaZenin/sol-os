@@ -9,6 +9,7 @@
 //! is touched.
 
 pub mod input;
+pub mod net;
 
 use crate::drivers::pci::{self, PciDevice};
 use crate::memory::hhdm::Hhdm;
